@@ -1,0 +1,27 @@
+# Build artifacts and dependencies — rebuilt inside the image
+node_modules/
+dist/
+__pycache__/
+*.pyc
+
+# Secrets — these are MOUNTED at runtime, never baked into an image layer.
+# Removing these lines will leak Google OAuth credentials into the image.
+credentials*.json
+token*.json
+.env
+.env.*
+!.env.example
+
+# Local runtime state (import_sheets.log is ~51 MB and would bloat the build context)
+*.log
+*.pid
+profile.csv
+
+# Editor / OS / agent noise
+.DS_Store
+.claude/
+.git/
+.gitignore
+tasks/
+*.md
+!DEPLOY.md

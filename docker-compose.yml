@@ -1,0 +1,63 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Reference stack for Stitch Debt Recovery Pulse.
+#
+# This is a working starting point, not a mandate — devops owns the final
+# orchestration. Both images are orchestrator-agnostic; only the wiring below
+# is compose-specific. See DEPLOY.md.
+#
+# There is deliberately NO mysql service here: the dashboard connects to the
+# existing production database.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cgreen-dashboard-app:latest
+    container_name: cgreen-dashboard-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # Put this behind your reverse proxy. The API sends
+      # Access-Control-Allow-Origin: * on every route (server.ts:184), so it
+      # should not be exposed to the public internet directly.
+      - "${APP_PORT:-3001}:3001"
+    volumes:
+      # Google Admin Directory OAuth client — read-only.
+      - ./credentials1.json:/app/credentials1.json:ro
+      # Rewritten by server.ts on every token refresh → MUST be writable by
+      # uid 1000. On a Linux host: sudo chown 1000:1000 token1.json
+      - ./token1.json:/app/token1.json
+      # Optional: local employee photos, used in preference to the Google API.
+      - employee-photos:/app/public/employee-photos
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/api/health').then(r=>r.json()).then(j=>process.exit(j.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  etl:
+    build:
+      context: .
+      dockerfile: Dockerfile.etl
+    image: cgreen-dashboard-etl:latest
+    container_name: cgreen-dashboard-etl
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Google Sheets OAuth client — read-only.
+      - ./credentials.json:/app/credentials.json:ro
+      # Rewritten by import_sheets.py on EVERY run → MUST be writable by
+      # uid 1000. On a Linux host: sudo chown 1000:1000 token.json
+      - ./token.json:/app/token.json
+
+volumes:
+  employee-photos:

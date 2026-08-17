@@ -1,0 +1,74 @@
+@import url("https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800&family=Inter:wght@400;500;600;700;800;900&display=swap");
+@import "./design-system.css";
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  font-family: var(--font-body);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--cg-ink-950);
+  font-family: var(--font-body);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.font-display {
+  font-family: var(--font-display);
+  letter-spacing: var(--tracking-normal);
+}
+
+.panel-shell {
+  border: 1px solid var(--border-subtle);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.04));
+  backdrop-filter: blur(var(--blur-panel));
+  border-radius: var(--radius-2xl);
+  box-shadow: var(--shadow-panel);
+}
+
+.label-kicker {
+  font-size: var(--text-kicker);
+  font-weight: var(--weight-extrabold);
+  letter-spacing: var(--tracking-kicker);
+  text-transform: uppercase;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  border-width: 1px;
+  border-radius: var(--radius-pill);
+  padding: 0.6rem 0.95rem;
+  font-size: var(--text-kicker);
+  font-weight: var(--weight-extrabold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+}
+
+.metric-card-value {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cg-stage-bg {
+  background:
+    radial-gradient(circle at top left, rgba(255, 203, 4, 0.14), transparent 22%),
+    radial-gradient(circle at top right, rgba(126, 146, 224, 0.18), transparent 24%),
+    linear-gradient(135deg, var(--cg-ink-950) 0%, var(--cg-ink-800) 46%, var(--cg-ink-900) 100%);
+}
+
+@media (max-width: 1279px) {
+  body {
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+}

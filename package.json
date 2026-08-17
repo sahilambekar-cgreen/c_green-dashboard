@@ -1,0 +1,38 @@
+{
+  "name": "stitch-debt-recovery-pulse-dashboard",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"tsx server.ts\" \"vite --host 0.0.0.0 --port 4173\"",
+    "build": "vite build",
+    "start": "NODE_ENV=production tsx server.ts",
+    "google:photos:auth": "node scripts/google_photos_auth.mjs",
+    "google:photos:test": "node scripts/test_employee_photos.mjs",
+    "google:photos:test-dashboard": "node --import tsx scripts/test_dashboard_photo_payload.mjs",
+    "employee:photo-names": "node scripts/list_employee_photo_names.mjs"
+  },
+  "dependencies": {
+    "canvas-confetti": "^1.9.3",
+    "express": "^5.1.0",
+    "framer-motion": "^12.18.1",
+    "lucide-react": "^0.525.0",
+    "mysql2": "^3.14.1",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tsx": "^4.20.3",
+    "use-sound": "^5.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.10",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.10",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "concurrently": "^9.2.0",
+    "tailwindcss": "^4.1.10",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.0"
+  }
+}

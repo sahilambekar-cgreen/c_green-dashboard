@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Stitch Debt Recovery Pulse — Google Sheets → MySQL ETL sidecar
+#
+# Replaces the hand-started `while true; do python import_sheets.py; sleep 60; done`
+# loop. Runs import_sheets.py every IMPORT_INTERVAL_SECONDS and logs to stdout.
+# See DEPLOY.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+FROM python:3.12-slim
+
+# tini forwards SIGTERM so `docker stop` interrupts the sleep immediately.
+# tzdata keeps ETL log timestamps in the same zone as the dashboard.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini tzdata \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONUNBUFFERED=1 \
+    IMPORT_INTERVAL_SECONDS=60 \
+    TZ=Asia/Kolkata
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY import_sheets.py ./
+COPY docker/etl-loop.sh /usr/local/bin/etl-loop.sh
+RUN chmod +x /usr/local/bin/etl-loop.sh
+
+# import_sheets.py rewrites its token file (see extract()), and resolves it
+# relative to the working directory — so /app must be writable by this uid.
+RUN useradd --uid 1000 --create-home etl && chown -R etl:etl /app
+USER etl
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/etl-loop.sh"]

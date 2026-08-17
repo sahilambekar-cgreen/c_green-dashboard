@@ -1,0 +1,18 @@
+credentials*.json
+token*.json
+.env
+.env.*
+!.env.example
+
+# PII — real employee names and email addresses. Transferred to devops
+# out-of-band, never committed. db/001_dashboard_tables.sql (schema only) IS
+# safe to commit and is deliberately not matched by these patterns.
+db/002_emp_details_data.sql
+*.log
+*.pid
+node_modules/
+dist/
+__pycache__/
+.DS_Store
+public/employee-photos/*
+!public/employee-photos/.gitkeep

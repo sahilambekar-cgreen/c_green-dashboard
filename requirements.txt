@@ -1,0 +1,6 @@
+mysql-connector-python
+pymysql
+gspread
+pandas
+google-auth
+google-auth-oauthlib

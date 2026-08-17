@@ -1,0 +1,123 @@
+/*
+ * Local CGReen design-system tokens.
+ *
+ * Keep these values in sync with the canonical design system when the brand
+ * evolves. The dashboard owns this copy so it can build and run without the
+ * sibling "CGreen Design System" directory.
+ */
+:root {
+  --cg-black: #000000;
+  --cg-yellow: #ffcb04;
+  --cg-grey: #838586;
+  --cg-grey-light: #dfe0e0;
+  --cg-blue: #4155a5;
+  --cg-white: #ffffff;
+  --cg-ink-950: #05070d;
+  --cg-ink-900: #080b14;
+  --cg-ink-800: #0d111f;
+  --cg-ink-700: #14182b;
+  --cg-ink-600: #1c2236;
+  --cg-ink-500: #283050;
+  --cg-yellow-bright: #ffd83a;
+  --cg-yellow-deep: #d9a800;
+  --cg-yellow-dim: #8a6e10;
+  --cg-blue-bright: #7e92e0;
+  --cg-blue-mid: #4155a5;
+  --cg-blue-deep: #2b3a78;
+  --cg-grey-50: #f4f5f6;
+  --cg-grey-200: #dfe0e0;
+  --cg-grey-400: #b4b6b8;
+  --cg-grey-500: #838586;
+  --cg-grey-700: #4c4e52;
+  --cg-danger: #e2574c;
+  --cg-danger-dim: rgba(226, 87, 76, 0.14);
+
+  --surface-bg: var(--cg-ink-900);
+  --surface-bg-2: var(--cg-ink-800);
+  --surface-panel: rgba(255, 255, 255, 0.05);
+  --surface-panel-strong: rgba(255, 255, 255, 0.08);
+  --surface-elevated: rgba(255, 255, 255, 0.07);
+  --surface-inset: rgba(0, 0, 0, 0.25);
+
+  --text-primary: var(--cg-white);
+  --text-secondary: rgba(223, 224, 224, 0.78);
+  --text-muted: rgba(223, 224, 224, 0.5);
+  --text-on-yellow: var(--cg-black);
+
+  --border-subtle: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --border-yellow: rgba(255, 203, 4, 0.5);
+  --border-blue: rgba(126, 146, 224, 0.42);
+
+  --accent-primary: var(--cg-yellow);
+  --accent-primary-soft: rgba(255, 203, 4, 0.12);
+  --accent-secondary: var(--cg-blue-bright);
+  --accent-secondary-soft: rgba(126, 146, 224, 0.12);
+
+  --status-win: var(--cg-yellow);
+  --status-win-soft: rgba(255, 203, 4, 0.14);
+  --status-live: var(--cg-blue-bright);
+  --status-live-soft: rgba(126, 146, 224, 0.14);
+  --status-danger: var(--cg-danger);
+  --status-danger-soft: var(--cg-danger-dim);
+
+  --font-display: "Barlow Condensed", "Inter", system-ui, sans-serif;
+  --font-body: "Inter", system-ui, -apple-system, sans-serif;
+
+  --text-hero: 7rem;
+  --text-display-xl: 4.5rem;
+  --text-display-lg: 3.25rem;
+  --text-display-md: 2.5rem;
+  --text-display-sm: 1.875rem;
+  --text-xl: 1.5rem;
+  --text-lg: 1.25rem;
+  --text-md: 1rem;
+  --text-sm: 0.875rem;
+  --text-xs: 0.75rem;
+  --text-kicker: 0.72rem;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+  --weight-extrabold: 800;
+  --weight-black: 900;
+
+  --tracking-tight: -0.01em;
+  --tracking-normal: 0.01em;
+  --tracking-kicker: 0.14em;
+  --tracking-caps: 0.12em;
+
+  --leading-none: 1;
+  --leading-tight: 1.12;
+  --leading-normal: 1.5;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.4rem;
+  --radius-2xl: 1.6rem;
+  --radius-pill: 999px;
+
+  --shadow-panel: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 24px 80px rgba(0, 0, 0, 0.28);
+  --shadow-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --glow-yellow: 0 0 34px rgba(255, 203, 4, 0.28);
+  --glow-blue: 0 0 30px rgba(126, 146, 224, 0.2);
+  --blur-panel: 28px;
+
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-fast: 0.18s;
+  --dur-mid: 0.34s;
+  --dur-slow: 0.6s;
+}
