@@ -56,8 +56,10 @@ type DashboardPayload = {
   latestSeenAt: string | null;
   metrics: {
     monthlyPoints: number;
+    monthlyAmountCollected: number;
     monthlyCollections: number;
     dailyPoints: number;
+    dailyAmountCollected: number;
     dailyCollections: number;
     totalCollections: number;
     activeAgents: number;
@@ -93,15 +95,17 @@ function getPayloadVersion(payload: DashboardPayload) {
   return [
     payload.latestSeenAt ?? "none",
     payload.metrics.monthlyPoints,
+    payload.metrics.monthlyAmountCollected,
     payload.metrics.monthlyCollections,
     payload.metrics.dailyPoints,
+    payload.metrics.dailyAmountCollected,
     payload.metrics.dailyCollections,
     payload.metrics.totalCollections,
     payload.metrics.activeAgents,
     payload.metrics.qualifiedCelebrations,
     payload.todayTopPerformer ? `${payload.todayTopPerformer.agentName}:${payload.todayTopPerformer.totalPoints}:${payload.todayTopPerformer.collectionCount}:${payload.todayTopPerformer.photoUrl ? "photo" : "no-photo"}` : "no-today-top",
     payload.monthlyTopPerformer ? `${payload.monthlyTopPerformer.agentName}:${payload.monthlyTopPerformer.totalPoints}:${payload.monthlyTopPerformer.collectionCount}:${payload.monthlyTopPerformer.photoUrl ? "photo" : "no-photo"}` : "no-monthly-top",
-    payload.recentCollections.map((row) => `${row.id}:${row.messageSentAt ?? "no-message-date"}:${row.points}:${row.qualifies}:${row.photoUrl ? "photo" : "no-photo"}`).join(","),
+    payload.recentCollections.map((row) => `${row.id}:${row.messageSentAt ?? "no-message-date"}:${row.amountCollected}:${row.points}:${row.qualifies}:${row.photoUrl ? "photo" : "no-photo"}`).join(","),
     payload.leaderboard.map((entry) => `${entry.rank}:${entry.agentName}:${entry.totalPoints}:${entry.collectionCount}:${entry.photoUrl ? "photo" : "no-photo"}`).join(",")
   ].join("|");
 }
@@ -127,12 +131,33 @@ const pointsExact = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 0
 });
 
+const rupeesCompact = new Intl.NumberFormat("en-IN", {
+  style: "currency",
+  currency: "INR",
+  notation: "compact",
+  maximumFractionDigits: 2
+});
+
+const rupeesExact = new Intl.NumberFormat("en-IN", {
+  style: "currency",
+  currency: "INR",
+  maximumFractionDigits: 2
+});
+
 function formatCompactPoints(value: number) {
   return `${pointsCompact.format(value)} pts`;
 }
 
 function formatExactPoints(value: number) {
   return `${pointsExact.format(value)} pts`;
+}
+
+function formatCompactRupees(value: number) {
+  return rupeesCompact.format(value);
+}
+
+function formatExactRupees(value: number) {
+  return rupeesExact.format(value);
 }
 
 const timeLabel = new Intl.DateTimeFormat("en-IN", {
@@ -228,7 +253,7 @@ function scheduleCrowdRoar(
   lfoGain.connect(gain.gain);
 
   source.connect(filter);
-  filter.connect(gain);
+  filter.connect(gain); 
   gain.connect(output);
 
   source.start(startTime);
@@ -853,15 +878,15 @@ function App() {
         >
           <MetricCard
             icon={<CalendarDays className="h-5 w-5" />}
-            label="Monthly points"
-            value={formatCompactPoints(metrics?.monthlyPoints ?? 0)}
+            label="Monthly Collection"
+            value={formatCompactRupees(metrics?.monthlyAmountCollected ?? 0)}
             accent="yellow"
             meta={`${metrics?.monthlyCollections ?? 0} collections this month`}
           />
           <MetricCard
             icon={<CircleDollarSign className="h-5 w-5" />}
-            label="Daily points"
-            value={formatCompactPoints(metrics?.dailyPoints ?? 0)}
+            label="Today's Collection"
+            value={formatCompactRupees(metrics?.dailyAmountCollected ?? 0)}
             accent="blue"
             meta={`${metrics?.dailyCollections ?? 0} collections today`}
           />
@@ -1146,7 +1171,7 @@ function RecentCollectionsRoll({
             </div>
             <div className="flex shrink-0 flex-col items-start sm:items-end sm:text-right">
               <p className={`font-display text-4xl font-bold md:text-5xl ${row.qualifies ? "text-[var(--cg-yellow)]" : "text-[var(--cg-blue-bright)]"}`}>
-                {formatCompactPoints(row.points)}
+                {formatExactRupees(row.amountCollected)}
               </p>
               <button
                 type="button"

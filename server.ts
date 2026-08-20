@@ -61,8 +61,10 @@ type EmployeePhotoTarget = {
 
 type PeriodMetricsRow = {
   monthly_points: number | null;
+  monthly_amount_collected: number | null;
   monthly_collections: number | null;
   daily_points: number | null;
+  daily_amount_collected: number | null;
   daily_collections: number | null;
 };
 
@@ -472,6 +474,7 @@ export async function buildDashboardPayload() {
         SELECT
           cm.id,
           cm.date_of_message_sent,
+          COALESCE(cm.amount_collected, 0) AS amount_collected,
           COALESCE(cm.amount_collected, 0) * ${bucketWeightSql} AS points
         FROM scoped_cm cm
         LEFT JOIN dossier_matches d
@@ -483,6 +486,7 @@ export async function buildDashboardPayload() {
       )
       SELECT
         COALESCE(SUM(COALESCE(pr.points, 0)), 0) AS monthly_points,
+        COALESCE(SUM(COALESCE(pr.amount_collected, 0)), 0) AS monthly_amount_collected,
         COUNT(pr.id) AS monthly_collections,
         COALESCE(SUM(
           CASE
@@ -492,6 +496,14 @@ export async function buildDashboardPayload() {
             ELSE 0
           END
         ), 0) AS daily_points,
+        COALESCE(SUM(
+          CASE
+            WHEN pr.date_of_message_sent >= b.today_start
+             AND pr.date_of_message_sent < b.tomorrow_start
+            THEN COALESCE(pr.amount_collected, 0)
+            ELSE 0
+          END
+        ), 0) AS daily_amount_collected,
         COUNT(
           CASE
             WHEN pr.date_of_message_sent >= b.today_start
@@ -805,8 +817,10 @@ export async function buildDashboardPayload() {
   const celebrationCandidate = celebrationQueue[0] ?? null;
   const periodMetrics = (periodMetricRows[0] as PeriodMetricsRow | undefined) ?? {
     monthly_points: 0,
+    monthly_amount_collected: 0,
     monthly_collections: 0,
     daily_points: 0,
+    daily_amount_collected: 0,
     daily_collections: 0
   };
   const leaderboard = (leaderboardRows as LeaderboardRow[]).map((row, index) => ({
@@ -862,8 +876,10 @@ export async function buildDashboardPayload() {
     latestSeenAt: latestBatchRows[0]?.latest_seen_at ?? null,
     metrics: {
       monthlyPoints: Number(periodMetrics.monthly_points ?? 0),
+      monthlyAmountCollected: Number(periodMetrics.monthly_amount_collected ?? 0),
       monthlyCollections: Number(periodMetrics.monthly_collections ?? 0),
       dailyPoints: Number(periodMetrics.daily_points ?? 0),
+      dailyAmountCollected: Number(periodMetrics.daily_amount_collected ?? 0),
       dailyCollections: Number(periodMetrics.daily_collections ?? 0),
       totalCollections: Number(latestBatchRows[0]?.total_rows ?? recentCollections.length),
       activeAgents: leaderboardRows.length,
@@ -885,8 +901,10 @@ function getDashboardVersion(payload: DashboardPayload) {
   return [
     payload.latestSeenAt ?? "none",
     payload.metrics.monthlyPoints,
+    payload.metrics.monthlyAmountCollected,
     payload.metrics.monthlyCollections,
     payload.metrics.dailyPoints,
+    payload.metrics.dailyAmountCollected,
     payload.metrics.dailyCollections,
     payload.metrics.totalCollections,
     payload.todayTopPerformer?.agentName ?? "none",
@@ -897,7 +915,7 @@ function getDashboardVersion(payload: DashboardPayload) {
     payload.monthlyTopPerformer?.photoUrl ? "month-photo" : "month-no-photo",
     payload.lenderMonthlyPoints.map((row) => `${row.rank}:${row.lenderName}:${row.totalPoints}:${row.collectionCount}`).join(","),
     payload.recentCollections[0]?.id ?? "none",
-    payload.recentCollections.map((row) => `${row.id}:${row.messageSentAt ?? "no-message-date"}:${row.points}:${row.qualifies}:${row.photoUrl ? "photo" : "no-photo"}`).join(","),
+    payload.recentCollections.map((row) => `${row.id}:${row.messageSentAt ?? "no-message-date"}:${row.amountCollected}:${row.points}:${row.qualifies}:${row.photoUrl ? "photo" : "no-photo"}`).join(","),
     payload.leaderboard.map((entry) => `${entry.rank}:${entry.emailId ?? entry.agentName}:${entry.totalPoints}:${entry.photoUrl ? "photo" : "no-photo"}`).join(",")
   ].join(":");
 }
