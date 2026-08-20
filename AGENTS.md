@@ -27,7 +27,7 @@
 ## Directory Structure
 
 - [src/](src/) — React app (`App.tsx`, `main.tsx`, `index.css`, `design-system.css`, `privacy.ts`, `vite-env.d.ts`). `design-system.css` contains the dashboard-owned copy of every CGReen brand token so builds never depend on the sibling `CGreen Design System` directory; `privacy.ts` contains shared display-data masking rules used by both the API and UI; `agent-name.ts` resolves the agent display name (roster → email-derived → source sheet → `Unassigned`).
-- [server.ts](server.ts) — Express API server. Exposes `/api/health`, `/api/dashboard`, `/api/dashboard/stream` (SSE live feed), `/api/dashboard.js`. In production it also serves the built `dist/` and injects the dashboard payload into `index.html` server-side.
+- [server.ts](server.ts) — Express API server. Loads the root `.env` file when present before creating the MySQL pool, then exposes `/api/health`, `/api/dashboard`, `/api/dashboard/stream` (SSE live feed), `/api/dashboard.js`. In production it also serves the built `dist/` and injects the dashboard payload into `index.html` server-side.
 - [dist/](dist/) — Vite build output (generated, not hand-edited).
 - [requirements.txt](requirements.txt) — Python dependencies for `import_sheets.py`.
 - [import_sheets.py](import_sheets.py) — Google Sheets → MySQL ETL. One-shot and idempotent: every run is a full upsert keyed on a SHA-256 `uid`. Rewrites its OAuth token file on every run.
@@ -43,7 +43,7 @@
 
 ## Commands
 
-- `npm run dev` — runs API server (`tsx server.ts`) and Vite dev server (port 4173) concurrently.
+- `npm run dev` — runs API server (`tsx server.ts`) and Vite dev server (port 4173) concurrently. The API loads database settings from the root `.env`; leave `NODE_ENV` unset there for local development because the Docker image sets production mode itself.
 - `npm run build` — Vite production build → `dist/`.
 - `npm start` — `NODE_ENV=production tsx server.ts`, serves built `dist/` + API from one process.
 - `python3 -m pip install -r requirements.txt` — installs Python dependencies for `import_sheets.py`.

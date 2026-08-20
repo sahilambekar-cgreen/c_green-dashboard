@@ -7,6 +7,15 @@ import { fileURLToPath } from "node:url";
 import { maskLoanAccountNumber } from "./src/privacy";
 import { resolveAgentName } from "./src/agent-name";
 
+// Vite reads .env for the frontend, but the separately started Express process
+// does not. Load the same root file before creating the MySQL pool so local
+// `npm run dev` uses the documented database settings without shell setup.
+try {
+  process.loadEnvFile();
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+}
+
 type DashboardRow = {
   id: number;
   client_name: string | null;

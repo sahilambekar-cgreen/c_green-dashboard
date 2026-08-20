@@ -1,6 +1,3 @@
-import { buildDashboardPayload } from "../server.ts";
-
-function maskEmail(email) {
   if (!email) return "no-email";
   const [name, domain] = email.split("@");
   if (!domain) return email;
