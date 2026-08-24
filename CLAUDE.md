@@ -66,21 +66,21 @@ The five tables, and who owns them:
 
 Locally that schema is `c_green`. In production it is whatever `DB_NAME` points at — the two tables above get added to the existing production database, which already has the other three.
 
-The static `bucket.weights` multiplier scale is `Bucket X=1`, `Bucket 1=1.25`, `Buket 2=1.6`, `NPA=2.1`, `Write Off=3.5`; `Multiple Bucket` and KL/test buckets are left null.
+The static stored `bucket.weights` scale is `Bucket X=1`, `Bucket 1=1.25`, `Buket 2=1.6`, `NPA=2.1`, `Write Off=3.5`; `Multiple Bucket` and KL/test buckets are left null. The API applies `RP_MULTIPLIER_SCALE=0.1` to produce the effective RP multipliers without changing production reference data.
 
 Connection defaults (overridable via `DB_SOCKET_PATH`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`): user `root`, password `1234`, db `c_green`. `DB_SOCKET_PATH` defaults to the local socket **only on macOS** — everywhere else it is unset so containers use `DB_HOST`/`DB_PORT`. A non-empty socket path makes mysql2 ignore host and port entirely. These defaults are mirrored in `server.ts` and `import_sheets.py` — keep them in sync if changed.
 
-Points and celebration qualification flow:
-- New `collections_messages` rows are evaluated from `email_id`, `loan_no`, and `amount_collected`; the dashboard displays normalized points instead of raw collection amount.
+Recovery Points (RP) and celebration qualification flow:
+- New `collections_messages` rows are evaluated from `email_id`, `loan_no`, and `amount_collected`; score displays use the `RP` unit everywhere.
 - Treat every LAN/loan account number as sensitive display data. The API must mask every character except the final four before returning dashboard payloads, and the frontend must apply the shared `maskLoanAccountNumber` helper again at the render boundary as defense in depth. LANs of four or fewer characters remain unchanged.
 - `email_id` maps to `emp_details.caller_emailid` to resolve `caller_name` and `caller_empcode`.
 - Agent display names resolve through `resolveAgentName` in `src/agent-name.ts`: `emp_details.caller_name` → derived from the email local part (`fname.lname@` → `Fname Lname`, trailing digits stripped) → `collections_messages.agent_name` → `Unassigned`. The email deliberately outranks the sheet column, which is hand-typed and carries misspellings and conflicting names for a single address. Do not reintroduce the sheet name as a higher-priority source; add the agent to `emp_details` instead.
 - `loan_no` maps to `dossier.loan_account_number` to resolve `dossier_code`, `lender_id`, and `dpd_bucket_id`. If a loan maps to multiple dossier rows/codes, the API picks the row with the latest non-null `due_date`, using newest dossier row id as a tie-breaker.
 - `lender_id` maps through `lenders.id` for lender context, and `dpd_bucket_id` maps through `bucket.id` for the canonical bucket name and multiplier context.
-- Points are calculated as `amount_collected * multiplier`. For normal buckets, the multiplier comes from `bucket.weights`; blank, null, or non-numeric weights count as `0` points. For `dpd_bucket_id = 7` (`Multiple Bucket`), the multiplier comes from `dossier.dpd_days`: `1-30=1`, `31-60=1.25`, `61-90=1.6`, `91-180=2.1`, `181-360=2.75`, `361+=3.5`. A row qualifies when points are greater than `500`, set in `server.ts` as `CELEBRATION_MIN_POINTS`.
+- RP is calculated as `amount_collected * effective multiplier`. The API scales stored `bucket.weights` by `0.1`, producing effective normal-bucket multipliers of `x0.1`, `x0.125`, `x0.16`, `x0.21`, and `x0.35`; blank, null, or non-numeric weights count as `0 RP`. For `dpd_bucket_id = 7` (`Multiple Bucket`), the effective multiplier comes from `dossier.dpd_days`: `1-30=0.1`, `31-60=0.125`, `61-90=0.16`, `91-180=0.21`, `181-360=0.275`, `361+=0.35`. A row qualifies when RP is greater than `500`, set in `server.ts` as `CELEBRATION_MIN_RP`.
 - The API does not use the removed `profiles` table.
 - The API returns qualifying rows in `celebrationQueue`; the frontend queues newly seen qualifying collection rows for the automatic celebration overlay and still uses `qualifiedCelebrations` to count auto triggers. Each recent collection card also has a manual Celebrate button that replays the overlay for that row, even if it did not qualify automatically. Celebration audio plays two bundled real recordings layered together — `src/assets/applause.wav` (CC0) and `src/assets/cheer.ogg` (Public Domain), both from Wikimedia Commons — for a loud "cheers + applause" burst (capped ~6s with a fade-out). If the recordings fail to load/play, it falls back to the in-browser synth (Web Audio crowd-roar + applause + whistles), and finally to a generated WAV data URL.
-- Dashboard queries should keep dossier lookups scoped to each panel's row set: current month for monthly points/top performer, today for today's leaderboard, and recent rows for the live feed.
+- Dashboard queries should keep dossier lookups scoped to each panel's row set: current month for monthly RP/top performer, today for today's leaderboard, and recent rows for the live feed.
 
 ## Deployment
 

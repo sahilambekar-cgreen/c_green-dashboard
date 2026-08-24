@@ -128,7 +128,12 @@ const pointsCompact = new Intl.NumberFormat("en-IN", {
 });
 
 const pointsExact = new Intl.NumberFormat("en-IN", {
-  maximumFractionDigits: 0
+  maximumFractionDigits: 2
+});
+
+const multiplierFormat = new Intl.NumberFormat("en-IN", {
+  minimumFractionDigits: 1,
+  maximumFractionDigits: 3
 });
 
 const rupeesCompact = new Intl.NumberFormat("en-IN", {
@@ -145,11 +150,11 @@ const rupeesExact = new Intl.NumberFormat("en-IN", {
 });
 
 function formatCompactPoints(value: number) {
-  return `${pointsCompact.format(value)} pts`;
+  return `${pointsCompact.format(value)} RP`;
 }
 
 function formatExactPoints(value: number) {
-  return `${pointsExact.format(value)} pts`;
+  return `${pointsExact.format(value)} RP`;
 }
 
 function formatCompactRupees(value: number) {
@@ -880,6 +885,7 @@ function App() {
             icon={<CalendarDays className="h-5 w-5" />}
             label="Monthly Collection"
             value={formatCompactRupees(metrics?.monthlyAmountCollected ?? 0)}
+            bracketedValue={formatCompactPoints(metrics?.monthlyPoints ?? 0)}
             accent="yellow"
             meta={`${metrics?.monthlyCollections ?? 0} collections this month`}
           />
@@ -887,6 +893,7 @@ function App() {
             icon={<CircleDollarSign className="h-5 w-5" />}
             label="Today's Collection"
             value={formatCompactRupees(metrics?.dailyAmountCollected ?? 0)}
+            bracketedValue={formatCompactPoints(metrics?.dailyPoints ?? 0)}
             accent="blue"
             meta={`${metrics?.dailyCollections ?? 0} collections today`}
           />
@@ -1163,7 +1170,7 @@ function RecentCollectionsRoll({
                   ) : null}
                 </p>
                 <p className="mt-2 label-kicker text-[var(--text-muted)]">
-                  {row.lenderName ?? "Unmapped lender"} | Multiplier {pointsExact.format(row.bucketWeight)}
+                  {row.lenderName ?? "Unmapped lender"} | Multiplier x{multiplierFormat.format(row.bucketWeight)}
                   {" | "}
                   {row.messageSentAt ? new Date(row.messageSentAt).toLocaleString("en-IN") : "Pending message timestamp"}
                 </p>
@@ -1241,12 +1248,14 @@ function EmployeeAvatar({
 function MetricCard({
   label,
   value,
+  bracketedValue,
   meta,
   icon,
   accent
 }: {
   label: string;
   value: string;
+  bracketedValue?: string;
   meta: string;
   icon: React.ReactNode;
   accent: "yellow" | "blue" | "grey";
@@ -1265,15 +1274,20 @@ function MetricCard({
       </div>
       <AnimatePresence initial={false} mode="wait">
         <motion.p
-          key={value}
-          title={value}
+          key={`${value}:${bracketedValue ?? ""}`}
+          title={bracketedValue ? `${value} (${bracketedValue})` : value}
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
           exit={{ opacity: 0, y: -10 }}
           transition={{ duration: 0.24, ease: "easeOut" }}
-          className="metric-card-value mt-4 font-display text-[clamp(2rem,2.8vw,3rem)] font-bold uppercase leading-none"
+          className={`metric-card-value mt-4 font-display text-[clamp(2rem,2.8vw,3rem)] font-bold uppercase leading-none ${
+            bracketedValue ? "metric-card-value-with-detail" : ""
+          }`}
         >
-          {value}
+          <span>{value}</span>
+          {bracketedValue ? (
+            <span className="whitespace-nowrap text-[0.55em] opacity-85">({bracketedValue})</span>
+          ) : null}
         </motion.p>
       </AnimatePresence>
       <p className="label-kicker mt-3 text-[var(--text-muted)]">{meta}</p>
@@ -1312,7 +1326,7 @@ function PanelHeader({
 
 function CelebrationOverlay({ collection }: { collection: CollectionRow }) {
   const detailText = collection.qualifies
-    ? `Points trigger hit for dossier ${collection.dossierCode ?? "unmapped"} in ${collection.bucketLabel ?? "unknown bucket"}`
+    ? `RP trigger hit for dossier ${collection.dossierCode ?? "unmapped"} in ${collection.bucketLabel ?? "unknown bucket"}`
     : `Collection posted for dossier ${collection.dossierCode ?? "unmapped"} in ${collection.bucketLabel ?? "unknown bucket"}`;
 
   return (

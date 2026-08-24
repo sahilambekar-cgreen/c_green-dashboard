@@ -59,6 +59,17 @@ body {
   white-space: nowrap;
 }
 
+.metric-card-value-with-detail {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 0.5rem;
+  row-gap: 0.25rem;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .cg-stage-bg {
   background:
     radial-gradient(circle at top left, rgba(255, 203, 4, 0.14), transparent 22%),

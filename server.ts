@@ -96,33 +96,36 @@ const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
 const distDir = path.join(__dirname, "dist");
 const dashboardStreamPollMs = Number(process.env.DASHBOARD_STREAM_POLL_MS ?? "2000");
-const CELEBRATION_MIN_POINTS = 500;
+const CELEBRATION_MIN_RP = 500;
+const RP_MULTIPLIER_SCALE = 0.1;
 const bucketWeightSql = `
-  CASE
-    WHEN d.dpd_bucket_id = 7 THEN
-      CASE
-        WHEN TRIM(COALESCE(d.dpd_days, '')) REGEXP '^[0-9]+(\\\\.[0-9]+)?$'
-        THEN
-          CASE
-            WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) >= 1
-             AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 30 THEN 1
-            WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 30
-             AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 60 THEN 1.25
-            WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 60
-             AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 90 THEN 1.6
-            WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 90
-             AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 180 THEN 2.1
-            WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 180
-             AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 360 THEN 2.75
-            WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 360 THEN 3.5
-            ELSE 0
-          END
-        ELSE 0
-      END
-    WHEN TRIM(COALESCE(b.weights, '')) REGEXP '^-?[0-9]+(\\\\.[0-9]+)?$'
-    THEN CAST(TRIM(b.weights) AS DECIMAL(18,6))
-    ELSE 0
-  END
+  (
+    CASE
+      WHEN d.dpd_bucket_id = 7 THEN
+        CASE
+          WHEN TRIM(COALESCE(d.dpd_days, '')) REGEXP '^[0-9]+(\\\\.[0-9]+)?$'
+          THEN
+            CASE
+              WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) >= 1
+               AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 30 THEN 1
+              WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 30
+               AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 60 THEN 1.25
+              WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 60
+               AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 90 THEN 1.6
+              WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 90
+               AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 180 THEN 2.1
+              WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 180
+               AND CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) <= 360 THEN 2.75
+              WHEN CAST(TRIM(d.dpd_days) AS DECIMAL(18,6)) > 360 THEN 3.5
+              ELSE 0
+            END
+          ELSE 0
+        END
+      WHEN TRIM(COALESCE(b.weights, '')) REGEXP '^-?[0-9]+(\\\\.[0-9]+)?$'
+      THEN CAST(TRIM(b.weights) AS DECIMAL(18,6))
+      ELSE 0
+    END
+  ) * ${RP_MULTIPLIER_SCALE}
 `;
 const employeePhotoPublicPath = "/employee-photos";
 const employeePhotoDir = path.join(publicDir, "employee-photos");
@@ -784,7 +787,7 @@ export async function buildDashboardPayload() {
   const recentCollections = (recentRows as DashboardRow[]).map((row) => {
     const amount = row.amount_collected ?? 0;
     const points = row.points ?? 0;
-    const target = CELEBRATION_MIN_POINTS;
+    const target = CELEBRATION_MIN_RP;
     return {
       id: row.id,
       clientName: row.client_name,
