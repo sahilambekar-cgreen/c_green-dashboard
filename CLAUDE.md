@@ -21,7 +21,7 @@
 
 - **Frontend:** React 19 + TypeScript, Vite 7, Tailwind CSS 4 (via `@tailwindcss/vite`), Framer Motion, lucide-react icons, canvas-confetti, use-sound.
 - **Backend:** Express 5 served via `tsx` (no separate compile step), MySQL access via `mysql2/promise`, live dashboard updates via Server-Sent Events.
-- **Data import tooling:** Python 3 (`mysql-connector-python`, `pymysql`, `gspread`, `pandas`, Google Auth libraries). `import_sheets.py` is the only ETL — Google Sheets → MySQL.
+- **Data import tooling:** Python 3 (`mysql-connector-python`, `pandas`, `requests`). `import_sheets.py` is the only ETL — Zoho Sheet → MySQL, over the Zoho Sheet API v2.
 - **Deployment:** two Docker images — `Dockerfile` (Node app) and `Dockerfile.etl` (Python ETL sidecar). See [DEPLOY.md](DEPLOY.md).
 
 ## Directory Structure
@@ -29,7 +29,8 @@
 - [src/](src/) — React app (`App.tsx`, `main.tsx`, `index.css`, `design-system.css`, `privacy.ts`, `vite-env.d.ts`). `design-system.css` contains the dashboard-owned copy of every CGReen brand token so builds never depend on the sibling `CGreen Design System` directory; `privacy.ts` contains shared display-data masking rules used by both the API and UI; `agent-name.ts` resolves the agent display name (roster → email-derived → source sheet → `Unassigned`).
 - [server.ts](server.ts) — Express API server. Exposes `/api/health`, `/api/dashboard`, `/api/dashboard/stream` (SSE live feed), `/api/dashboard.js`. In production it also serves the built `dist/` and injects the dashboard payload into `index.html` server-side.
 - [dist/](dist/) — Vite build output (generated, not hand-edited).
-- [import_sheets.py](import_sheets.py) — Google Sheets → MySQL ETL. One-shot and idempotent: every run is a full upsert keyed on a SHA-256 `uid`. Rewrites its OAuth token file on every run.
+- [import_sheets.py](import_sheets.py) — Zoho Sheet → MySQL ETL. One-shot and idempotent: every run is a full upsert keyed on a SHA-256 `uid`, which is a hash of the Cliq **message id** — an identity key, not a content hash, so an edited message updates its row instead of inserting a duplicate. Writes nothing to disk — Zoho auth is three env vars, so the ETL container needs no credential mounts and runs read-only.
+- [scripts/zoho_probe.py](scripts/zoho_probe.py) — read-only diagnostic. Prints the sheet's real headers, how each cell would parse, and which `COLUMN_MAP` entries are missing. Run it whenever the source sheet changes shape.
 - [Dockerfile](Dockerfile) — multi-stage build of the app image (Node 22 Alpine, tini, non-root uid 1000).
 - [Dockerfile.etl](Dockerfile.etl) — ETL sidecar image (Python 3.12 slim).
 - [docker/etl-loop.sh](docker/etl-loop.sh) — interval loop wrapper around `import_sheets.py`; honours `IMPORT_INTERVAL_SECONDS` and traps SIGTERM.
@@ -37,6 +38,8 @@
 - [.env.example](.env.example) — the full environment contract. Copy to `.env`.
 - [db/001_dashboard_tables.sql](db/001_dashboard_tables.sql) — DDL for the two tables production must add, plus the pre-flight check and least-privilege grants. Schema only, safe to commit.
 - `db/002_emp_details_data.sql` — populated 162-row `emp_details` seed, `INSERT IGNORE` so re-runs are safe. **Gitignored: contains real employee names and emails.** Transferred to devops out-of-band.
+- [db/003_version_status.sql](db/003_version_status.sql) — adds `collections_messages.version_status` for the Zoho message lifecycle. Additive and idempotent; safe to commit and re-run.
+- [db/004_msg_id.sql](db/004_msg_id.sql) — adds `collections_messages.msg_id`: traceability back to the Cliq message, and the ownership marker that keeps Google-era rows out of reconciliation. Additive and idempotent.
 - [DEPLOY.md](DEPLOY.md) — devops handoff: provisioning, env vars, secret mounts, health checks, troubleshooting, token rotation, known limits.
 
 ## Commands
@@ -44,7 +47,8 @@
 - `npm run dev` — runs API server (`tsx server.ts`) and Vite dev server (port 4173) concurrently.
 - `npm run build` — Vite production build → `dist/`.
 - `npm start` — `NODE_ENV=production tsx server.ts`, serves built `dist/` + API from one process.
-- `python3 import_sheets.py` — one ETL run. The first run on a new machine opens a browser for Google consent and writes `token.json`; every run after that is unattended.
+- `python3 import_sheets.py` — one ETL run. Fully unattended on every run, including the first: the Zoho refresh token comes from the environment and is never cached to disk.
+- `python3 scripts/zoho_probe.py` — print the Zoho sheet's real headers and cell encodings without touching MySQL. Run this before editing `COLUMN_MAP`.
 - `docker compose up -d --build` — build and run the full stack (app + ETL sidecar). Requires `.env`, copied from `.env.example`.
 - `docker compose logs -f etl` — watch ETL cycles.
 - Live dashboard stream polling defaults to every 2 seconds inside the API server; override with `DASHBOARD_STREAM_POLL_MS`. This cost is **per connected client**.
@@ -72,6 +76,15 @@ Connection defaults (overridable via `DB_SOCKET_PATH`, `DB_HOST`, `DB_PORT`, `DB
 
 Recovery Points (RP) and celebration qualification flow:
 - New `collections_messages` rows are evaluated from `email_id`, `loan_no`, and `amount_collected`; score displays use the `RP` unit everywhere.
+- **`Collection_Data.email_id` is the Cliq bot** (`collectionchatbot@cgreen.in`) on every row, not the agent. The ETL discards it and resolves the agent's real address from `emp_id` → `emp_details.caller_empcode` → `caller_emailid`, writing that into `email_id` so the dashboard's existing email join works unchanged. When the code is unknown it writes **NULL, never the bot** — a bot address would group every agent into one leaderboard row. Consequence: **`emp_id` is now the sole agent identity**, so a mis-extracted employee code silently credits the wrong person.
+- **`date_of_message_sent` arrives in two different encodings in the same sheet.** The AI extractor writes some rows as epoch milliseconds (`1788420181031.0`) and others as 12-hour day-first text (`'3/9/2026 5:40:54 PM'`). `parse_datetime` must handle both; a form it cannot read returns `NULL`, and a NULL date is invisible to every KPI filter and the recent feed while the row still loads — the run reports success. The counted `WARNING` in `transform()` is the only signal, so do not remove it.
+- **Epoch timestamps are converted through an explicit timezone, never the process's own.** `BUSINESS_TZ` resolves `TZ` (default `Asia/Kolkata`) via `zoneinfo`, because `datetime.fromtimestamp()` without a tzinfo uses platform local time: a Linux container honours `TZ=Asia/Kolkata` while Windows cannot parse an IANA name and silently falls back to UTC, landing the same message 5.5 hours apart. `tzdata` is in `requirements.txt` so the zone resolves off-Linux too. The sheet's own `ai_processed_time` column is the ground truth to check a conversion against.
+- **Numeric-looking identifiers must be coerced to clean strings** (`IDENTIFIER_COLUMNS` in `import_sheets.py`). Zoho sends `loan_id` as a float, and `'4007266194.0'` matches zero `dossier` rows where `'4007266194'` matches two. The join supplies the bucket weight, so the failure is silent and total: the row loads, scores 0 RP, and never reaches the leaderboard.
+- A collection can be **edited or retracted** in Zoho Cliq after it is posted. Two rules follow, and both are load-bearing:
+  - `uid` is `SHA-256(msg_id)` — an **identity** key. Never rederive it from row contents: an edited amount would hash differently, insert a second row, orphan the first, and double-count that agent permanently.
+  - Retracted rows are kept and flagged `version_status = 'DELETED'`. **Every** query reading `collections_messages` must apply `liveCollectionsFilter` in `server.ts` (six sites today); a query that omits it keeps scoring retracted collections on that panel. `NULL` means live.
+- **`msg_id` marks row ownership.** Rows imported from the old Google sheet keep it `NULL` and are deliberately kept as history. Their `uid` is a content hash, so it can never appear in what Zoho reports — which would make every one of them a permanent reconciliation candidate. `SELECT_LIVE_UIDS_SQL` therefore filters on `msg_id IS NOT NULL`. Do not remove that predicate: the ratio guard alone stops protecting them once Zoho exceeds roughly four times the legacy row count, and a single run would then flag the entire history `DELETED`.
+- The ETL also reconciles: rows the sheet no longer lists are flagged `DELETED`. This is correct **only while `Collection_Data` retains all history** — if the tab is ever rotated or archived, set `RECONCILE_MISSING_ROWS=false` first, or every row outside the current window is hidden. Guarded by `RECONCILE_MIN_RATIO` (default 80%) so a partial fetch cannot read as a mass deletion.
 - Treat every LAN/loan account number as sensitive display data. The API must mask every character except the final four before returning dashboard payloads, and the frontend must apply the shared `maskLoanAccountNumber` helper again at the render boundary as defense in depth. LANs of four or fewer characters remain unchanged.
 - `email_id` maps to `emp_details.caller_emailid` to resolve `caller_name` and `caller_empcode`.
 - Agent display names resolve through `resolveAgentName` in `src/agent-name.ts`: `emp_details.caller_name` → derived from the email local part (`fname.lname@` → `Fname Lname`, trailing digits stripped) → `collections_messages.agent_name` → `Unassigned`. The email deliberately outranks the sheet column, which is hand-typed and carries misspellings and conflicting names for a single address. Do not reintroduce the sheet name as a higher-priority source; add the agent to `emp_details` instead.
@@ -87,12 +100,15 @@ Recovery Points (RP) and celebration qualification flow:
 Full detail in [DEPLOY.md](DEPLOY.md). The parts that constrain code changes:
 
 - **Two images, one stack.** `app` (Express + built `dist/`, port 3001) and `etl` (`import_sheets.py` on a loop). No MySQL container — production supplies the database.
-- **Four Google credential files are mounted, never baked into an image.** `.dockerignore` excludes `credentials*.json` and `token*.json` specifically. Do not add them to a `COPY`.
-- **`token.json` and `token1.json` must be mounted read-write.** `import_sheets.py` rewrites its token on every run and `server.ts` rewrites `token1.json` on refresh. Any change that assumes a read-only filesystem will break both.
+- **Two Google credential files are mounted on the `app` image only, never baked in.** `credentials1.json` / `token1.json`, used solely for employee photos. `.dockerignore` excludes `credentials*.json` and `token*.json` specifically. Do not add them to a `COPY`.
+- **`token1.json` must be mounted read-write.** `server.ts` rewrites it on refresh, so a `:ro` mount fails at refresh time — not at startup — and survives a smoke test.
+- **The `etl` image mounts nothing and runs `read_only: true`.** Zoho auth is `ZOHO_CLIENT_ID` / `ZOHO_CLIENT_SECRET` / `ZOHO_REFRESH_TOKEN` in the environment. Do not reintroduce a token cache file.
+- **The Zoho data centre must match the account.** `ZOHO_ACCOUNTS_URL` and `ZOHO_SHEET_API_URL` both default to `.in`. Pointing an India account at `.com` returns 404, which misreads as a bad `ZOHO_RESOURCE_ID`. Change both together.
 - **Containers run as uid 1000**, so mounted token files must be writable by that uid.
 - **`TZ` matters.** Daily/monthly KPI boundaries are computed in local time; a UTC container shifts the business day.
 - **`NODE_ENV=production` is required** for the server to serve `dist/` at all.
-- Neither OAuth token can be minted inside a container — both flows need an interactive browser.
+- The Google photo token (`token1.json`) cannot be minted inside a container — that flow needs an interactive browser. The Zoho refresh token has no such constraint: it is minted once from a Self Client at `api-console.zoho.in` and then lives in the environment.
+- Employee photos still come from the **Google Admin Directory** API. If the org leaves Google Workspace this breaks independently of the ETL: `/api/photo-health` reports `ok: false` and avatars fall back to initials. No code change is needed to fix it — files dropped into `public/employee-photos/` take priority over the API.
 
 ## Tasks / Lessons
 

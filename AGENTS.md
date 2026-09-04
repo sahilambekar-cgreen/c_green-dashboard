@@ -21,7 +21,7 @@
 
 - **Frontend:** React 19 + TypeScript, Vite 7, Tailwind CSS 4 (via `@tailwindcss/vite`), Framer Motion, lucide-react icons, canvas-confetti, use-sound.
 - **Backend:** Express 5 served via `tsx` (no separate compile step), MySQL access via `mysql2/promise`, live dashboard updates via Server-Sent Events.
-- **Data import tooling:** Python 3 (`mysql-connector-python`, `pymysql`, `gspread`, `pandas`, Google Auth libraries). `import_sheets.py` is the only ETL — Google Sheets → MySQL.
+- **Data import tooling:** Python 3 (`mysql-connector-python`, `pandas`, `requests`). `import_sheets.py` is the only ETL — Zoho Sheet → MySQL, over the Zoho Sheet API v2.
 - **Deployment:** two Docker images — `Dockerfile` (Node app) and `Dockerfile.etl` (Python ETL sidecar). See [DEPLOY.md](DEPLOY.md).
 
 ## Directory Structure
@@ -30,7 +30,8 @@
 - [server.ts](server.ts) — Express API server. Loads the root `.env` file when present before creating the MySQL pool, then exposes `/api/health`, `/api/dashboard`, `/api/dashboard/stream` (SSE live feed), `/api/dashboard.js`. In production it also serves the built `dist/` and injects the dashboard payload into `index.html` server-side.
 - [dist/](dist/) — Vite build output (generated, not hand-edited).
 - [requirements.txt](requirements.txt) — Python dependencies for `import_sheets.py`.
-- [import_sheets.py](import_sheets.py) — Google Sheets → MySQL ETL. One-shot and idempotent: every run is a full upsert keyed on a SHA-256 `uid`. Rewrites its OAuth token file on every run.
+- [import_sheets.py](import_sheets.py) — Zoho Sheet → MySQL ETL. One-shot and idempotent: every run is a full upsert keyed on a SHA-256 `uid`, which is a hash of the Cliq **message id** — an identity key, not a content hash, so an edited message updates its row instead of inserting a duplicate. Writes nothing to disk — Zoho auth is three env vars, so the ETL container needs no credential mounts and runs read-only.
+- [scripts/zoho_probe.py](scripts/zoho_probe.py) — read-only diagnostic. Prints the sheet's real headers, how each cell would parse, and which `COLUMN_MAP` entries are missing. Run it whenever the source sheet changes shape.
 - [prod_seeder.py](prod_seeder.py) — production → local MySQL clone utility. Validates and recreates all five dashboard base-table schemas, then streams and verifies production rows for the four reference tables (`emp_details`, `dossier`, `lenders`, `bucket`). `collections_messages` is deliberately created empty with its auto-increment reset so `import_sheets.py` can populate local collection events independently. The target is restricted to loopback/socket connections unless explicitly overridden; existing dashboard tables require `--replace`.
 - [Dockerfile](Dockerfile) — multi-stage build of the app image (Node 22 Alpine, tini, non-root uid 1000). It type-checks the API and frontend before building the Vite bundle with the full locked dependency graph, installs a separate clean production-only dependency tree, and copies the runtime TypeScript configuration plus the latest `server.ts`, shared `src/` helpers, built `dist/`, and `public/` assets into the final image.
 - [Dockerfile.etl](Dockerfile.etl) — ETL sidecar image (Python 3.12 slim).
@@ -39,6 +40,7 @@
 - [.env.example](.env.example) — the full environment contract. Copy to `.env`.
 - [db/001_dashboard_tables.sql](db/001_dashboard_tables.sql) — DDL for the two tables production must add, plus the pre-flight check and least-privilege grants. Schema only, safe to commit.
 - `db/002_emp_details_data.sql` — populated 162-row `emp_details` seed, `INSERT IGNORE` so re-runs are safe. **Gitignored: contains real employee names and emails.** Transferred to devops out-of-band.
+- [db/003_version_status.sql](db/003_version_status.sql) — adds `collections_messages.version_status` for the Zoho message lifecycle. Additive and idempotent; safe to commit and re-run.
 - [DEPLOY.md](DEPLOY.md) — devops handoff: provisioning, env vars, secret mounts, health checks, troubleshooting, token rotation, known limits.
 
 ## Commands
@@ -47,7 +49,8 @@
 - `npm run build` — Vite production build → `dist/`.
 - `npm start` — `NODE_ENV=production tsx server.ts`, serves built `dist/` + API from one process.
 - `python3 -m pip install -r requirements.txt` — installs Python dependencies for `import_sheets.py`.
-- `python3 import_sheets.py` — one ETL run. The first run on a new machine opens a browser for Google consent and writes `token.json`; every run after that is unattended.
+- `python3 import_sheets.py` — one ETL run. Fully unattended on every run, including the first: the Zoho refresh token comes from the environment and is never cached to disk.
+- `python3 scripts/zoho_probe.py` — print the Zoho sheet's real headers and cell encodings without touching MySQL. Run this before editing `COLUMN_MAP`.
 - `PROD_DB_HOST=<host> PROD_DB_USER=<read-user> PROD_DB_PASSWORD=<password> PROD_DB_NAME=<schema> python3 prod_seeder.py` — clone all five production dashboard schemas and the contents of the four reference tables into local MySQL; `collections_messages` starts empty. Local defaults are `root` / `1234` / `c_green`; override with `LOCAL_DB_HOST`, `LOCAL_DB_PORT`, `LOCAL_DB_USER`, `LOCAL_DB_PASSWORD`, `LOCAL_DB_NAME`, or `LOCAL_DB_SOCKET_PATH`. The dashboard tables must be absent on the first run; use `--replace` to deliberately rebuild them.
 - `docker compose up -d --build` — build and run the full stack (app + ETL sidecar). Requires `.env`, copied from `.env.example`.
 - `docker compose logs -f etl` — watch ETL cycles.
@@ -99,7 +102,9 @@ Full detail in [DEPLOY.md](DEPLOY.md). The parts that constrain code changes:
 
 - **Two images, one stack.** `app` (Express + built `dist/`, port 3001) and `etl` (`import_sheets.py` on a loop). No MySQL container — production supplies the database.
 - **Four Google credential files are mounted, never baked into an image.** `.dockerignore` excludes `credentials*.json` and `token*.json` specifically. Do not add them to a `COPY`.
-- **`token.json` and `token1.json` must be mounted read-write.** `import_sheets.py` rewrites its token on every run and `server.ts` rewrites `token1.json` on refresh. Any change that assumes a read-only filesystem will break both.
+- **`token1.json` must be mounted read-write.** `server.ts` rewrites it on refresh, so a `:ro` mount fails at refresh time — not at startup — and survives a smoke test.
+- **The `etl` image mounts nothing and runs `read_only: true`.** Zoho auth is `ZOHO_CLIENT_ID` / `ZOHO_CLIENT_SECRET` / `ZOHO_REFRESH_TOKEN` in the environment. Do not reintroduce a token cache file.
+- **The Zoho data centre must match the account.** `ZOHO_ACCOUNTS_URL` and `ZOHO_SHEET_API_URL` both default to `.in`. Pointing an India account at `.com` returns 404, which misreads as a bad `ZOHO_RESOURCE_ID`. Change both together.
 - **Containers run as uid 1000**, so mounted token files must be writable by that uid.
 - **`TZ` matters.** Daily/monthly KPI boundaries are computed in local time; a UTC container shifts the business day.
 - **`NODE_ENV=production` is required** for the server to serve `dist/` at all.

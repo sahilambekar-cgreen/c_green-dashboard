@@ -98,6 +98,12 @@ const distDir = path.join(__dirname, "dist");
 const dashboardStreamPollMs = Number(process.env.DASHBOARD_STREAM_POLL_MS ?? "2000");
 const CELEBRATION_MIN_RP = 500;
 const RP_MULTIPLIER_SCALE = 0.1;
+// A collection posted in Zoho Cliq can be retracted after the fact. The ETL
+// keeps the row for audit and flags it, so every read of collections_messages
+// must exclude it here — miss one query and a retracted collection keeps
+// scoring on that panel. NULL means live: rows written before the column
+// existed, and every row Zoho still considers current.
+const liveCollectionsFilter = `(version_status IS NULL OR version_status <> 'DELETED')`;
 const bucketWeightSql = `
   (
     CASE
@@ -431,6 +437,7 @@ export async function buildDashboardPayload() {
         MAX(date_of_message_sent) AS latest_seen_at,
         COUNT(*) AS total_rows
       FROM collections_messages
+      WHERE ${liveCollectionsFilter}
     `
   );
 
@@ -455,6 +462,7 @@ export async function buildDashboardPayload() {
         JOIN bounds b
           ON cm.date_of_message_sent >= b.month_start
          AND cm.date_of_message_sent < b.next_month_start
+        WHERE ${liveCollectionsFilter}
       ),
       dossier_matches AS (
         SELECT
@@ -537,6 +545,7 @@ export async function buildDashboardPayload() {
         JOIN bounds b
           ON date_of_message_sent >= b.today_start
          AND date_of_message_sent < b.tomorrow_start
+        WHERE ${liveCollectionsFilter}
       ),
       dossier_matches AS (
         SELECT
@@ -600,6 +609,7 @@ export async function buildDashboardPayload() {
         JOIN bounds b
           ON date_of_message_sent >= b.month_start
          AND date_of_message_sent < b.next_month_start
+        WHERE ${liveCollectionsFilter}
       ),
       dossier_matches AS (
         SELECT
@@ -666,6 +676,7 @@ export async function buildDashboardPayload() {
         JOIN bounds b
           ON date_of_message_sent >= b.month_start
          AND date_of_message_sent < b.next_month_start
+        WHERE ${liveCollectionsFilter}
       ),
       dossier_matches AS (
         SELECT
@@ -728,6 +739,7 @@ export async function buildDashboardPayload() {
           email_id,
           date_of_message_sent
         FROM collections_messages
+        WHERE ${liveCollectionsFilter}
         ORDER BY date_of_message_sent DESC, id DESC
         LIMIT 12
       ),

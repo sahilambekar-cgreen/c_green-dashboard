@@ -52,12 +52,14 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    volumes:
-      # Google Sheets OAuth client — read-only.
-      - ./credentials.json:/app/credentials.json:ro
-      # Rewritten by import_sheets.py on EVERY run → MUST be writable by
-      # uid 1000. On a Linux host: sudo chown 1000:1000 token.json
-      - ./token.json:/app/token.json
+    # No volumes. Zoho auth is three env vars (ZOHO_CLIENT_ID / _SECRET /
+    # _REFRESH_TOKEN) and the ETL writes nothing, so there is no credential file
+    # to mount and no writable path to own.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   employee-photos:

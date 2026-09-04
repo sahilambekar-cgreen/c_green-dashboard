@@ -1,21 +1,27 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Stitch Debt Recovery Pulse — Google Sheets → MySQL ETL sidecar
+# Stitch Debt Recovery Pulse — Zoho Sheet → MySQL ETL sidecar
 #
-# Replaces the hand-started `while true; do python import_sheets.py; sleep 60; done`
-# loop. Runs import_sheets.py every IMPORT_INTERVAL_SECONDS and logs to stdout.
-# See DEPLOY.md.
+# Runs import_sheets.py every IMPORT_INTERVAL_SECONDS and logs to stdout.
+#
+# This image mounts NO credential files and needs NO writable filesystem. The
+# Google Sheets version it replaced cached an OAuth token on disk and rewrote it
+# on every run; Zoho's refresh token is a non-expiring env var, so the container
+# is stateless and can run with `read_only: true`. See DEPLOY.md.
 # ─────────────────────────────────────────────────────────────────────────────
 
 FROM python:3.12-slim
 
 # tini forwards SIGTERM so `docker stop` interrupts the sleep immediately.
 # tzdata keeps ETL log timestamps in the same zone as the dashboard.
+# ca-certificates is required for TLS to accounts.zoho.in and sheet.zoho.in —
+# the slim base does not guarantee a CA bundle.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini tzdata \
+ && apt-get install -y --no-install-recommends tini tzdata ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \
     IMPORT_INTERVAL_SECONDS=60 \
+    SHEET_TAB=Collection_Data \
     TZ=Asia/Kolkata
 
 WORKDIR /app
@@ -23,13 +29,22 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# NOTE for maintainers: this image lists its files EXPLICITLY, unlike the app
+# image which copies the whole tree. Editing the files below needs no change
+# here — a rebuild picks the new content up. But adding a NEW Python module that
+# import_sheets.py imports requires a COPY line, or the container dies at import
+# time with ModuleNotFoundError while the code works fine on a dev machine.
 COPY import_sheets.py ./
+# Diagnostic, not part of the loop. DEPLOY.md's troubleshooting steps call for it
+# when the sheet's shape is in question, so it has to exist inside the image:
+#   docker compose exec etl python scripts/zoho_probe.py
+COPY scripts/zoho_probe.py ./scripts/
 COPY docker/etl-loop.sh /usr/local/bin/etl-loop.sh
 RUN chmod +x /usr/local/bin/etl-loop.sh
 
-# import_sheets.py rewrites its token file (see extract()), and resolves it
-# relative to the working directory — so /app must be writable by this uid.
-RUN useradd --uid 1000 --create-home etl && chown -R etl:etl /app
+# Run unprivileged. Nothing under /app is written at runtime, so no chown is
+# needed and the filesystem can be mounted read-only.
+RUN useradd --uid 1000 --create-home etl
 USER etl
 
 ENTRYPOINT ["/usr/bin/tini", "--"]

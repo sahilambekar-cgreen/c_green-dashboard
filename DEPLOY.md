@@ -10,8 +10,8 @@ A TV/war-room dashboard for the debt collection floor. Two containers:
 
 ```
                         ┌──────────────────────────────┐
-   Google Sheet  ──────▶│  etl  (Dockerfile.etl)       │
-   (collections log)    │  import_sheets.py, every 60s │
+   Zoho Sheet    ──────▶│  etl  (Dockerfile.etl)       │
+   (Collection_Data tab) │  import_sheets.py, every 60s │
                         └──────────────┬───────────────┘
                                        │ INSERT/UPDATE
                                        │ collections_messages
@@ -36,9 +36,10 @@ A TV/war-room dashboard for the debt collection floor. Two containers:
 - **`app`** — single Node process. Serves the React bundle from `dist/` *and* the
   `/api/*` routes, so there is no separate web server to run. Pushes live updates
   to each TV over Server-Sent Events.
-- **`etl`** — Python sidecar. Pulls a Google Sheet and upserts it into
-  `collections_messages` on a loop. Every run is a full idempotent upsert, so a
-  missed run self-heals on the next one.
+- **`etl`** — Python sidecar. Pulls the Zoho Sheet `Collection_Data` tab over the
+  Zoho Sheet API v2 and upserts it into `collections_messages` on a loop. Every
+  run is a full idempotent upsert, so a missed run self-heals on the next one.
+  It mounts no files and writes nothing, so it runs `read_only: true`.
 
 There is **no database container**. The dashboard connects to your existing
 production MySQL.
@@ -73,9 +74,64 @@ Then load the employee roster (see §2.4):
 mysql -h <host> -u <admin-user> -p <schema> < db/002_emp_details_data.sql
 ```
 
+Finally, add the two Zoho columns (see §2.1.1):
+
+```bash
+mysql -h <host> -u <admin-user> -p <schema> < db/003_version_status.sql
+mysql -h <host> -u <admin-user> -p <schema> < db/004_msg_id.sql
+```
+
+**Both must be applied before pointing the new ETL at the schema** — every insert
+carries `version_status` and `msg_id`, so a missing column fails the whole run.
+
 > **All five tables must live in the SAME schema.** Every SQL statement in
 > `server.ts` uses unqualified table names, so they all resolve against `DB_NAME`.
 > A cross-schema layout will not work without code changes.
+
+### 2.1.1 Message lifecycle (`version_status`)
+
+A collection posted in Zoho Cliq can be **edited or retracted** after the fact.
+Two mechanisms handle that, and both matter for correctness:
+
+**Row identity.** `uid` is a SHA-256 of the Cliq **message id**, not of the row's
+contents. If it hashed the contents, correcting an amount would produce a
+different `uid`, so the ETL would insert a second row and orphan the first — the
+collection would then be counted **twice** on the leaderboard, permanently.
+Keying on the message id makes an edit an `UPDATE` of the same row.
+
+**Visibility.** Retracted messages are kept for audit and flagged
+`version_status = 'DELETED'`. All six dashboard queries exclude them via
+`(version_status IS NULL OR version_status <> 'DELETED')`. `NULL` means live,
+so rows predating the column need no backfill.
+
+[`db/003_version_status.sql`](db/003_version_status.sql) adds the column. It is
+additive and idempotent — one nullable column plus an index, no data rewritten,
+no downtime, safe to re-run.
+
+> ### Reconciliation — read before enabling in a rotated sheet
+>
+> A row can also vanish from the sheet with **no** `DELETED` flag (someone
+> removes the spreadsheet row). Nothing in the payload reports it, so the ETL
+> compares the sheet against the database each run and hides anything the sheet
+> no longer lists. It **marks** rather than deletes, so a mistake self-heals: if
+> the row reappears, the next run clears the flag automatically.
+>
+> Rows imported from the old Google sheet are kept as history and are **excluded
+> from reconciliation entirely** — they have `msg_id IS NULL`, and the candidate
+> query filters on it. This is not optional tidiness: their `uid` is a content
+> hash that can never match what Zoho reports, so they are permanent deletion
+> candidates, and the ratio guard only masks that until Zoho grows past roughly
+> four times the legacy row count.
+>
+> This is safe **only because `Collection_Data` retains all history.** If the tab
+> is ever rotated or archived, an absent row stops meaning "retracted" and this
+> would hide every collection outside the current window. Set
+> `RECONCILE_MISSING_ROWS=false` before that happens.
+>
+> Two guards are always on: reconciliation is skipped if the sheet returns less
+> than `RECONCILE_MIN_RATIO` (default 80%) of the live database rows — a partial
+> fetch must never read as a mass deletion — and `RECONCILE_DRY_RUN=true` logs
+> what it would hide without changing anything. Run dry for the first few cycles.
 
 ### 2.2 Pre-flight check
 
@@ -169,12 +225,28 @@ Copy `.env.example` to `.env` and fill it in. Both containers read the same file
 | `TZ` | yes | `Asia/Kolkata` | Daily/monthly KPIs roll over at the wrong hour |
 | `DASHBOARD_STREAM_POLL_MS` | no | `2000` | See §8 — this cost is **per connected TV** |
 | `IMPORT_INTERVAL_SECONDS` | no | `60` | How stale the dashboard gets |
-| `SHEET_URL` | yes | *(baked default)* | ETL imports the wrong sheet |
-| `SHEET_TAB` | no | `Sheet1` | ETL exits with a worksheet error |
-| `GOOGLE_CREDENTIALS` | no | `credentials.json` | Path *inside* the container |
-| `GOOGLE_TOKEN` | no | `token.json` | Path *inside* the container |
+| `ZOHO_CLIENT_ID` | yes | — | ETL exits 1 naming the missing variable |
+| `ZOHO_CLIENT_SECRET` | yes | — | ETL exits 1 naming the missing variable |
+| `ZOHO_REFRESH_TOKEN` | yes | — | ETL exits 1 naming the missing variable |
+| `ZOHO_RESOURCE_ID` | yes | *(baked default)* | ETL imports the wrong sheet, or 404s |
+| `ZOHO_ACCOUNTS_URL` | no | `https://accounts.zoho.in` | **Must match the account's data centre** — see below |
+| `ZOHO_SHEET_API_URL` | no | `https://sheet.zoho.in/api/v2` | **Must match the account's data centre** — see below |
+| `SHEET_TAB` | no | `Collection_Data` | ETL exits with a worksheet error. `Raw_Messages` is unparsed chat text and will not work |
+| `ZOHO_PAGE_SIZE` | no | `1000` | Pagination size for `worksheet.records.fetch` |
+| `ZOHO_TIMEOUT_SECONDS` | no | `60` | HTTP timeout for both Zoho calls |
+| `ZOHO_FETCH_CRITERIA` | no | *(empty)* | Optional server-side row filter; unset reads every row |
+| `ZOHO_MESSAGE_ID_COLUMN` | no | `msg_id` | Row identity. Wrong value ⇒ edits insert duplicate rows |
+| `ZOHO_VERSION_STATUS_COLUMN` | no | `version_status` | Deletion signal. Wrong value ⇒ retracted rows keep scoring |
+| `RECONCILE_MISSING_ROWS` | no | `true` | **Set `false` if the sheet is ever rotated/archived** — see §2.2 |
+| `RECONCILE_MIN_RATIO` | no | `0.8` | Refuses to reconcile below this share; guards against a partial fetch |
+| `RECONCILE_DRY_RUN` | no | `false` | Log what would be hidden without changing anything |
 | `GOOGLE_PHOTOS_CREDENTIALS` | no | `credentials1.json` | Path *inside* the container |
 | `GOOGLE_PHOTOS_TOKEN` | no | `token1.json` | Path *inside* the container |
+
+> **Zoho data centre.** The two `ZOHO_*_URL` values must both point at the DC the
+> account was provisioned in — `.in` for India, `.com` for the US, `.eu`, `.com.au`.
+> A DC mismatch does **not** return an auth error: the Sheet API returns **404**,
+> which reads like a wrong `ZOHO_RESOURCE_ID`. Change both URLs together.
 
 `.env` contains a database password. Keep it out of version control (it is in
 `.gitignore` and `.dockerignore`) and restrict it to `chmod 600`.
@@ -183,33 +255,35 @@ Copy `.env.example` to `.env` and fill it in. Both containers read the same file
 
 ## 4. Secret files to mount
 
-These four files are **not** in the image — `.dockerignore` excludes them
+These two files are **not** in the image — `.dockerignore` excludes them
 specifically so no credential ends up in a layer. They must be mounted at runtime.
 
 | File | Container path | Used by | Mode |
 |---|---|---|---|
-| `credentials.json` | `/app/credentials.json` | etl | **read-only** |
-| `token.json` | `/app/token.json` | etl | **READ-WRITE** |
 | `credentials1.json` | `/app/credentials1.json` | app | **read-only** |
 | `token1.json` | `/app/token1.json` | app | **READ-WRITE** |
 
-> ### The read-write requirement is not optional
+**The `etl` container mounts nothing.** Its Zoho credentials are three environment
+variables and it never writes to disk, so it runs with `read_only: true`. Do not
+add a token file back — that would reintroduce the writable-mount problem below.
+
+> ### The read-write requirement is not optional (app only)
 >
-> Both token files are **rewritten in place** whenever the OAuth access token is
-> refreshed — `import_sheets.py` does this on *every* run, `server.ts` whenever the
-> access token is within 60s of expiry. Mount them read-only and the ETL crashes;
-> mount them on ephemeral storage and every restart forces a fresh refresh.
+> `token1.json` is **rewritten in place** whenever the Google access token is
+> within 60s of expiry. Mount it read-only and the app crashes *at refresh time* —
+> up to an hour after start, so it survives a smoke test. Mount it on ephemeral
+> storage and every restart forces a fresh refresh.
 >
-> Both containers run as **uid 1000**. On a Linux host the mounted files must be
+> The container runs as **uid 1000**. On a Linux host the mounted file must be
 > writable by that uid:
 >
 > ```bash
-> sudo chown 1000:1000 token.json token1.json
-> sudo chmod 600 token.json token1.json
+> sudo chown 1000:1000 token1.json
+> sudo chmod 600 token1.json
 > ```
 >
-> Both writers truncate in place rather than doing an atomic rename, so
-> single-file bind mounts work correctly.
+> The writer truncates in place rather than doing an atomic rename, so a
+> single-file bind mount works correctly.
 
 Optional: `employee-photos` volume at `/app/public/employee-photos`. Drop image
 files there named after the agent's email with non-alphanumerics replaced by
@@ -243,8 +317,7 @@ docker run -d --name cgreen-dashboard-app --env-file .env -p 3001:3001 \
 
 ```bash
 docker run -d --name cgreen-dashboard-etl --env-file .env \
-  -v "$PWD/credentials.json:/app/credentials.json:ro" \
-  -v "$PWD/token.json:/app/token.json" \
+  --read-only --tmpfs /tmp \
   cgreen-dashboard-etl:latest
 ```
 
@@ -295,31 +368,47 @@ on a content hash, so unchanged rows are simply re-written.
 | Blank page, 404 on assets | `NODE_ENV` is not `production` | Set `NODE_ENV=production` |
 | KPIs roll over at the wrong time of day | `TZ` unset → container defaults to UTC | Set `TZ=Asia/Kolkata` |
 | ETL: `PERMISSION_DENIED` / 403 | Sheet not shared with the token's Google account, or Sheets API disabled | Share the sheet; enable the Sheets API in the GCP project |
-| ETL: `invalid_grant` / token refresh fails | Refresh token expired or revoked | Re-mint `token.json` (§8) |
-| ETL crashes with a read-only filesystem error | `token.json` mounted `:ro` or owned by the wrong uid | See §4 |
+| ETL: `Zoho rejected the refresh token: invalid_client` | Wrong client id/secret, or they came from a different DC than `ZOHO_ACCOUNTS_URL` | Re-mint from the correct console (§8) |
+| ETL: `Zoho returned 404 for resource ...` | Usually a **data centre mismatch**, not a bad id | Check `ZOHO_ACCOUNTS_URL` *and* `ZOHO_SHEET_API_URL` (§3) |
+| ETL: `Zoho returned 401` | Client lacks the `ZohoSheet.dataAPI.READ` scope | Re-mint with the scope (§8) |
+| ETL: `missing expected columns` then exits 1 | Sheet headers renamed | Run `python3 scripts/zoho_probe.py`, fix `COLUMN_MAP` |
+| ETL: `N rows have an unparseable date_of_message_sent` | Zoho changed its date encoding | Rows load but stay invisible on the dashboard — run the probe and check `parse_datetime` |
 | Photos missing, `/api/photo-health` shows `hasRefreshToken: false` | `token1.json` missing or not persisted | Re-mint `token1.json` (§8) and mount it read-write |
 
 ---
 
 ## 8. Token rotation
 
-**Neither token can be minted inside the container.** Both flows require an
-interactive browser. Mint on a workstation, then copy the resulting file to the
-host and restart the container.
+### `ZOHO_REFRESH_TOKEN` — Zoho Sheet (ETL)
 
-### `token.json` — Google Sheets (ETL)
+Minted once from a **Self Client**, which needs no redirect URI and no local
+server, then stored as an environment variable. It does not expire, so there is
+nothing to rotate on a schedule and nothing to copy onto the host.
 
-On a machine with a browser and this repo checked out:
+1. Go to **https://api-console.zoho.in** → *Add Client* → **Self Client**.
+2. Scope `ZohoSheet.dataAPI.READ`, duration 10 minutes. Generate the code.
+3. Exchange it for a refresh token (within those 10 minutes):
 
 ```bash
-pip install -r requirements.txt
-python3 import_sheets.py
+curl -X POST "https://accounts.zoho.in/oauth/v2/token" \
+  -d "code=<the generated code>" \
+  -d "client_id=<client id>" \
+  -d "client_secret=<client secret>" \
+  -d "grant_type=authorization_code"
 ```
 
-The first run opens a browser for consent and writes `token.json`. Requires an
-account with read access to the sheet.
+4. Put `refresh_token` from the response into `.env` as `ZOHO_REFRESH_TOKEN`,
+   alongside `ZOHO_CLIENT_ID` and `ZOHO_CLIENT_SECRET`.
+5. Verify before deploying: `python3 scripts/zoho_probe.py` prints the sheet's
+   headers and sample rows without touching the database.
+
+Use the `.in` hosts above only if the account is in the India DC — see §3.
 
 ### `token1.json` — Google Admin Directory (employee photos)
+
+**This one cannot be minted inside the container** — the flow requires an
+interactive browser. Mint on a workstation, then copy the file to the host and
+restart the container.
 
 ```bash
 npm install

@@ -1,49 +1,84 @@
 """
-ETL: Google Sheets → Local MySQL (collections_messages)
+ETL: Zoho Sheet → MySQL (collections_messages)
 
-Reads structured rows from a Google Sheet, cleans them, and upserts into
-a local MySQL table. Safe to re-run — uses a deterministic SHA-256 uid
+Reads structured rows from the `Collection_Data` tab of a Zoho Sheet, cleans
+them, and upserts into MySQL. Safe to re-run — uses a deterministic SHA-256 uid
 so duplicate rows are updated, never duplicated.
 
-Authentication: OAuth user credentials via credentials.json.
-- First run opens a browser for consent → saves token.json.
-- All subsequent runs (including cron) use the cached token silently.
+Authentication: Zoho OAuth refresh token, supplied entirely via environment
+variables (ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET / ZOHO_REFRESH_TOKEN).
+
+Unlike the Google Sheets version this replaced, NOTHING is written to disk:
+there is no credentials file, no token cache, and no browser consent step. The
+refresh token is minted once from a Zoho Self Client (api-console.zoho.in) and
+does not expire, so this script can run in a read-only container with no
+mounted secrets. See DEPLOY.md.
 """
 
 import hashlib
 import logging
 import os
+import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
-import gspread
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python < 3.9
+    ZoneInfo = None
+
 import mysql.connector
 from mysql.connector import Error as MySQLError
 import pandas as pd
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+import requests
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # Read from environment variables with sensible local-dev defaults.
+#
+# The data centre matters: an account provisioned in India is only reachable on
+# the .in domains, and the same request against .com returns 404 (not 401), so a
+# DC mismatch looks like a bad resource id. Both hosts are overridable.
 # ──────────────────────────────────────────────────────────────────────────────
 
-SPREADSHEET_URL = os.getenv(
-    "SHEET_URL",
-    "https://docs.google.com/spreadsheets/d/1GsyC6Cc_SobMkQnfkQSRrF1IaatY0iw5v7uIKz221PE/edit?gid=0#gid=0",
-)
-SHEET_TAB = os.getenv("SHEET_TAB", "Sheet1")
-CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS", "credentials.json")
-TOKEN_FILE = os.getenv("GOOGLE_TOKEN", "token.json")
+ZOHO_ACCOUNTS_URL = os.getenv("ZOHO_ACCOUNTS_URL", "https://accounts.zoho.in").rstrip("/")
+ZOHO_SHEET_API_URL = os.getenv("ZOHO_SHEET_API_URL", "https://sheet.zoho.in/api/v2").rstrip("/")
+ZOHO_RESOURCE_ID = os.getenv("ZOHO_RESOURCE_ID", "fym3rf908df9958f14c4c8c3593ae476cd81d")
+ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
+ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
+ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
+
+SHEET_TAB = os.getenv("SHEET_TAB", "Collection_Data")
+
+# Zoho caps a single fetch, so every run pages until a short page comes back.
+ZOHO_PAGE_SIZE = int(os.getenv("ZOHO_PAGE_SIZE", "1000"))
+ZOHO_TIMEOUT_SECONDS = int(os.getenv("ZOHO_TIMEOUT_SECONDS", "60"))
+# Optional row filter, e.g. '"status" == "ACTIVE"'. Left unset, every row is read
+# and the ETL filters in transform(), which keeps the behaviour identical to the
+# full-sheet read this replaced.
+ZOHO_FETCH_CRITERIA = os.getenv("ZOHO_FETCH_CRITERIA", "").strip()
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Hide database rows the sheet no longer lists. Safe because Collection_Data
+# retains all history; turn it off if the tab is ever rotated or archived.
+RECONCILE_ENABLED = env_flag("RECONCILE_MISSING_ROWS", True)
+# Refuse to reconcile when the sheet returns implausibly fewer rows than the
+# database holds — that is a partial fetch, not a mass deletion.
+RECONCILE_MIN_RATIO = float(os.getenv("RECONCILE_MIN_RATIO", "0.8"))
+# Log what reconciliation would hide without changing anything.
+RECONCILE_DRY_RUN = env_flag("RECONCILE_DRY_RUN", False)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "1234")  # no hardcoded password — set via env
 DB_NAME = os.getenv("DB_NAME", "c_green")
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -57,33 +92,19 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# EXPECTED COLUMNS (header row in the sheet, after normalization to
-# lowercase with spaces → underscores)
+# COLUMN MAPPING (sheet header, normalized to lowercase-with-underscores →
+# collections_messages column)
+#
+# The Zoho Collection_Data tab was built to feed this table, so the mapping is
+# 1:1 — "Amount Collected" normalizes to amount_collected, and so on. Only the
+# KEYS may change if the sheet is renamed: the VALUES are database column names
+# and the dashboard SQL depends on them.
+#
+# The sheet also carries ID / UID / Created At columns. Those are deliberately
+# NOT imported: `id` and `created_at` are generated by MySQL, and `uid` is
+# derived here from the message id (see generate_uid).
 # ──────────────────────────────────────────────────────────────────────────────
 
-# These must match the sheet headers EXACTLY after normalization.
-SHEET_COLUMNS = [
-    "client_name",
-    "bucket",
-    "loan_id",
-    "customer_name",
-    "collection_amt",
-    "utr_number",
-    "date_of_collection",
-    "name_of_agent",
-    "group",
-    "waiver",
-    "emp_id",
-    "tl_name",
-    "email_id",
-    "sender_name",
-    "date_of_message_sent",
-    "message_sent",
-    "link_to_message",
-    "status",
-]
-
-# Mapping: sheet column (normalized) → database column name
 COLUMN_MAP = {
     "client_name": "client_name",
     "bucket": "bucket",
@@ -98,40 +119,157 @@ COLUMN_MAP = {
     "emp_id": "emp_id",
     "tl_name": "tl_name",
     "email_id": "email_id",
-    "sender_name": "sender_name",
+    # The tab has no plain `sender_name` / `status`; these are the AI extractor's
+    # equivalents. `status` is stored but read by nothing in the dashboard.
+    "sender_name_ai": "sender_name",
     "date_of_message_sent": "date_of_message_sent",
     "message_sent": "message_sent",
     "link_to_message": "link_to_message_sent",
-    "status": "status",
+    "ai_status": "status",
 }
+
+# Identifiers that arrive as numbers and must not keep a float tail. Zoho sends
+# loan_id as 4007266194.0; `dossier.loan_account_number` stores '4007266194', so
+# the string form decides whether the row scores at all — a mismatch silently
+# yields a bucket weight of 0 and no points, with no error anywhere.
+IDENTIFIER_COLUMNS = ("loan_no", "utr_no", "emp_id")
+
+SHEET_COLUMNS = list(COLUMN_MAP)
+
+# ── Message lifecycle ────────────────────────────────────────────────────────
+# A collection posted in Zoho Cliq can later be edited or retracted, and the
+# sheet reports that through these two columns. They are control signals, not
+# business data: msg_id decides row identity, version_status decides visibility.
+MESSAGE_ID_COLUMN = os.getenv("ZOHO_MESSAGE_ID_COLUMN", "msg_id")
+VERSION_STATUS_COLUMN = os.getenv("ZOHO_VERSION_STATUS_COLUMN", "version_status")
+CONTROL_COLUMNS = (MESSAGE_ID_COLUMN, VERSION_STATUS_COLUMN)
+
+# Compared case-insensitively. Everything that is not DELETED counts as live, so
+# an unrecognised value fails safe (visible) rather than silently hiding a real
+# collection.
+DELETED_STATUS = "DELETED"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
+NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
+AMOUNT_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
-def generate_uid(row: dict) -> str:
-    """
-    Deterministic UID: SHA-256 of loan_no | transaction_date | utr_no | amount | agent_name.
+# Spreadsheet serial dates count days from this anchor (the Excel/Sheets epoch,
+# which is deliberately two days behind 1900-01-01 to reproduce Excel's leap-year
+# bug). Zoho uses the same convention.
+SPREADSHEET_EPOCH = datetime(1899, 12, 30)
 
-    Using more fields reduces collisions when utr_no is blank.
+# Epoch timestamps are an absolute instant; the database column is a naive
+# DATETIME holding BUSINESS-LOCAL wall clock, and the dashboard computes its
+# daily/monthly boundaries in that same local time. Converting through the
+# process's own timezone would make the stored value depend on where the ETL
+# happens to run: a Linux container honours TZ=Asia/Kolkata, while Windows
+# cannot parse an IANA name and silently falls back to UTC — the same message
+# would land 5.5 hours apart. Resolve the zone explicitly instead.
+BUSINESS_TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
+
+
+def resolve_business_tz():
+    if ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo(BUSINESS_TZ_NAME)
+    except Exception:
+        # No tz database for this name (bare Windows without the `tzdata`
+        # package). Fall back to platform local time and say so, rather than
+        # failing the run.
+        log.warning(
+            f"Timezone '{BUSINESS_TZ_NAME}' is unavailable; epoch timestamps will use "
+            "this machine's local time. Install the `tzdata` package for exact behaviour."
+        )
+        return None
+
+
+BUSINESS_TZ = resolve_business_tz()
+
+
+def normalize_header(name: str) -> str:
+    """'Date of Message Sent' → 'date_of_message_sent'."""
+    return str(name).strip().lower().replace(" ", "_")
+
+
+def generate_uid(message_id) -> str | None:
     """
-    raw = (
-        f"{row.get('loan_no', '')}|"
-        f"{row.get('transaction_date', '')}|"
-        f"{row.get('utr_no', '')}|"
-        f"{row.get('amount_collected', '')}|"
-        f"{row.get('agent_name', '')}"
-    )
-    return hashlib.sha256(raw.encode()).hexdigest()
+    Row identity: SHA-256 of the Zoho Cliq message id.
+
+    This is an IDENTITY key, not a content hash. The distinction matters because
+    messages can be edited. Hashing the row's contents — the amount, say — means
+    a correction produces a different uid, so the ETL inserts a second row and
+    leaves the original orphaned: the collection is then counted twice on the
+    leaderboard, and no later run can ever fix it.
+
+    Hashing the message id instead keeps a corrected message pointing at the same
+    row, so an edit becomes an UPDATE. The digest is 64 hex chars, matching the
+    existing `uid char(64)` unique key, so no schema change was needed.
+    """
+    identity = "" if message_id is None else str(message_id).strip()
+    if not identity:
+        return None
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def is_deleted(version_status) -> bool:
+    """True when Zoho reports the message as retracted."""
+    if version_status is None:
+        return False
+    return str(version_status).strip().upper() == DELETED_STATUS
+
+
+def parse_spreadsheet_number(text: str):
+    """
+    Convert a numeric date cell to a datetime.
+
+    Zoho returns date/time cells as numbers rather than formatted strings, in one
+    of three encodings. They are told apart by magnitude, which is unambiguous
+    for any plausible business date:
+        < 100000     spreadsheet serial (days since 1899-12-30); ~46000 = 2026
+        ~1e9         Unix epoch seconds
+        ~1e12        Unix epoch milliseconds (what Zoho Cliq stamps messages with)
+    """
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+
+    if number <= 0:
+        return None
+
+    if number < 100_000:
+        return SPREADSHEET_EPOCH + timedelta(days=number)
+
+    if number >= 1e11:
+        number /= 1000.0
+
+    # Read the instant as UTC, then express it as business-local wall clock and
+    # drop the offset, because the destination column is a naive DATETIME.
+    try:
+        moment = datetime.fromtimestamp(number, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+    if BUSINESS_TZ is None:
+        return moment.astimezone().replace(tzinfo=None)
+    return moment.astimezone(BUSINESS_TZ).replace(tzinfo=None)
 
 
 def parse_date(value):
-    """Parse a date string to a date object. Returns None if no format matches."""
+    """Parse a date cell to a date object. Returns None if nothing matches."""
     if not value or str(value).strip() == "":
         return None
     text = str(value).strip()
+
+    if NUMERIC_RE.match(text):
+        moment = parse_spreadsheet_number(text)
+        return moment.date() if moment else None
+
     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
         try:
             return datetime.strptime(text, fmt).date()
@@ -141,15 +279,17 @@ def parse_date(value):
 
 
 def parse_datetime(value):
-    """Parse a datetime string. Returns None if no format matches."""
+    """Parse a datetime cell. Returns None if nothing matches."""
     if not value or str(value).strip() == "":
         return None
     text = str(value).strip()
 
+    if NUMERIC_RE.match(text):
+        return parse_spreadsheet_number(text)
+
     # Handle "June 5, 2026 at 9:22 AM IST" format
     # Strip timezone abbreviation (IST, EST, PST, etc.) from end
-    import re
-    text_no_tz = re.sub(r'\s+[A-Z]{2,4}$', '', text)
+    text_no_tz = re.sub(r"\s+[A-Z]{2,4}$", "", text)
 
     # Handle "Month Day, Year at H:MM AM/PM" format
     for fmt in (
@@ -162,6 +302,24 @@ def parse_datetime(value):
     ):
         try:
             return datetime.strptime(text_no_tz, fmt)
+        except ValueError:
+            continue
+
+    # 12-hour clock with AM/PM. Zoho writes this form for rows the extractor
+    # timestamps as text ("3/9/2026 5:40:54 PM") while sending others as epoch
+    # millis, so BOTH paths have to work in the same run. Day-first is
+    # deliberate and matches the source's locale.
+    for fmt in (
+        "%d/%m/%Y %I:%M:%S %p",
+        "%d/%m/%Y %I:%M %p",
+        "%d-%m-%Y %I:%M:%S %p",
+        "%d-%m-%Y %I:%M %p",
+        "%Y-%m-%d %I:%M:%S %p",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M %p",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
         except ValueError:
             continue
 
@@ -183,12 +341,52 @@ def parse_datetime(value):
     return None
 
 
-def parse_amount(value) -> float | None:
-    """Parse collection_amt, stripping commas. Returns None on failure."""
+def parse_identifier(value):
+    """
+    Normalise an identifier that the sheet may deliver as a number.
+
+    A numeric cell reaches pandas as a float, so the loan number 4007266194
+    stringifies to '4007266194.0' and no longer matches
+    `dossier.loan_account_number`. That join is what supplies the bucket weight,
+    so the failure is silent and total: the row loads, scores 0, and never
+    appears on the leaderboard.
+    """
     if value is None:
         return None
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        if pd.isna(value):
+            return None
+        if value.is_integer():
+            return str(int(value))
+        return repr(value)
+    if isinstance(value, int):
+        return str(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+    # '4007266194.0' arriving as text, same problem.
+    whole = re.fullmatch(r"(-?\d+)\.0+", text)
+    return whole.group(1) if whole else text
+
+
+def parse_amount(value) -> float | None:
+    """
+    Parse the collection amount.
+
+    Pulls the first number out of the cell rather than cleaning the string in
+    place, so a currency prefix survives: stripping non-digits from "Rs. 5000.50"
+    leaves ".5000.50", which is not a float.
+    """
+    if value is None:
+        return None
+    match = AMOUNT_RE.search(str(value).replace(",", ""))
+    if not match:
+        return None
     try:
-        return float(str(value).replace(",", "").strip())
+        return float(match.group())
     except (ValueError, TypeError):
         return None
 
@@ -198,57 +396,129 @@ def parse_amount(value) -> float | None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def extract() -> pd.DataFrame:
+def get_access_token() -> str:
     """
-    Authenticate via OAuth (credentials.json + cached token.json), open the
-    sheet by URL, and return all rows as a DataFrame keyed by header name.
+    Exchange the long-lived refresh token for a 1-hour access token.
+
+    Not cached: this script is one-shot and exits after each run, so a token
+    would never be reused. The refresh token itself does not expire.
     """
-    creds = None
-
-    # Try loading an existing token
-    if os.path.exists(TOKEN_FILE):
-        try:
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-        except (ValueError, KeyError):
-            creds = None
-
-    # Refresh or run the OAuth flow
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    elif not creds or not creds.valid:
-        if not os.path.exists(CREDENTIALS_FILE):
-            log.error(
-                f"OAuth credentials file not found at '{CREDENTIALS_FILE}'. "
-                "Download it from GCP Console → APIs & Services → Credentials."
-            )
-            sys.exit(1)
-        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-        creds = flow.run_local_server(port=0)
-
-    # Persist the token for future unattended runs
-    with open(TOKEN_FILE, "w") as f:
-        f.write(creds.to_json())
-
-    gc = gspread.authorize(creds)
-
-    try:
-        spreadsheet = gc.open_by_url(SPREADSHEET_URL)
-    except gspread.exceptions.APIError as e:
-        error_msg = str(e)
-        if "PERMISSION_DENIED" in error_msg or "403" in error_msg:
-            log.error(
-                "Cannot access the spreadsheet. Make sure you have:\n"
-                "  1. Enabled the Google Sheets API in your GCP project.\n"
-                "  2. Your Google account has access to the sheet."
-            )
-        else:
-            log.error(f"Google Sheets API error: {e}")
+    missing = [
+        name
+        for name, value in (
+            ("ZOHO_CLIENT_ID", ZOHO_CLIENT_ID),
+            ("ZOHO_CLIENT_SECRET", ZOHO_CLIENT_SECRET),
+            ("ZOHO_REFRESH_TOKEN", ZOHO_REFRESH_TOKEN),
+        )
+        if not value
+    ]
+    if missing:
+        log.error(
+            "Missing required Zoho environment variables: %s. "
+            "Mint them from a Self Client at %s — see DEPLOY.md.",
+            ", ".join(missing),
+            "https://api-console.zoho.in",
+        )
         sys.exit(1)
 
-    worksheet = spreadsheet.worksheet(SHEET_TAB)
-    records = worksheet.get_all_records()
-    df = pd.DataFrame(records)
+    try:
+        response = requests.post(
+            f"{ZOHO_ACCOUNTS_URL}/oauth/v2/token",
+            data={
+                "refresh_token": ZOHO_REFRESH_TOKEN,
+                "client_id": ZOHO_CLIENT_ID,
+                "client_secret": ZOHO_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+            },
+            timeout=ZOHO_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as error:
+        log.error(f"Cannot reach Zoho Accounts at {ZOHO_ACCOUNTS_URL}: {error}")
+        sys.exit(1)
 
+    # Zoho reports credential failures as HTTP 200 with an `error` key, so the
+    # status code alone is not enough to decide success.
+    payload = {}
+    try:
+        payload = response.json()
+    except ValueError:
+        pass
+
+    if payload.get("error"):
+        log.error(
+            f"Zoho rejected the refresh token: {payload['error']}. "
+            "Check ZOHO_CLIENT_ID/SECRET/REFRESH_TOKEN, and that all three came "
+            f"from the same data centre as {ZOHO_ACCOUNTS_URL}."
+        )
+        sys.exit(1)
+
+    if not response.ok or not payload.get("access_token"):
+        log.error(f"Unexpected Zoho token response: HTTP {response.status_code} {response.text[:300]}")
+        sys.exit(1)
+
+    return payload["access_token"]
+
+
+def fetch_records(access_token: str) -> list[dict]:
+    """Page through worksheet.records.fetch until a short page comes back."""
+    url = f"{ZOHO_SHEET_API_URL}/{ZOHO_RESOURCE_ID}"
+    headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+
+    records: list[dict] = []
+    start_index = 0
+
+    while True:
+        payload = {
+            "method": "worksheet.records.fetch",
+            "worksheet_name": SHEET_TAB,
+            "count": ZOHO_PAGE_SIZE,
+            "records_start_index": start_index,
+        }
+        if ZOHO_FETCH_CRITERIA:
+            payload["criteria"] = ZOHO_FETCH_CRITERIA
+
+        try:
+            response = requests.post(url, headers=headers, data=payload, timeout=ZOHO_TIMEOUT_SECONDS)
+        except requests.RequestException as error:
+            log.error(f"Cannot reach Zoho Sheet at {ZOHO_SHEET_API_URL}: {error}")
+            sys.exit(1)
+
+        if response.status_code == 401:
+            log.error("Zoho returned 401. The access token was rejected — confirm the client has the ZohoSheet.dataAPI.READ scope.")
+            sys.exit(1)
+        if response.status_code == 404:
+            log.error(
+                f"Zoho returned 404 for resource '{ZOHO_RESOURCE_ID}'. Either the id is wrong, "
+                f"or the sheet lives in a different data centre than {ZOHO_SHEET_API_URL}."
+            )
+            sys.exit(1)
+        if not response.ok:
+            log.error(f"Zoho Sheet API error: HTTP {response.status_code} {response.text[:300]}")
+            sys.exit(1)
+
+        try:
+            body = response.json()
+        except ValueError:
+            log.error(f"Zoho Sheet returned a non-JSON response: {response.text[:300]}")
+            sys.exit(1)
+
+        if str(body.get("status", "")).lower() == "failure":
+            log.error(f"Zoho Sheet rejected the request: {body}")
+            sys.exit(1)
+
+        batch = body.get("records") or []
+        records.extend(batch)
+
+        if len(batch) < ZOHO_PAGE_SIZE:
+            return records
+
+        start_index += ZOHO_PAGE_SIZE
+
+
+def extract() -> pd.DataFrame:
+    """Authenticate against Zoho and return every Collection_Data row."""
+    records = fetch_records(get_access_token())
+    df = pd.DataFrame(records)
     log.info(f"[Extract] Fetched {len(df)} rows from '{SHEET_TAB}'")
     return df
 
@@ -258,14 +528,80 @@ def extract() -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def transform(df: pd.DataFrame) -> list[dict]:
+ROSTER_SQL = """
+SELECT caller_empcode, caller_emailid
+FROM emp_details
+WHERE caller_empcode IS NOT NULL AND TRIM(caller_empcode) != ''
+  AND caller_emailid IS NOT NULL AND TRIM(caller_emailid) != ''
+"""
+
+
+def load_roster_emails(conn) -> dict[str, str]:
+    """
+    Map employee code -> real agent email, from emp_details.
+
+    Needed because the Zoho tab reports `email_id` as the Cliq bot
+    (collectionchatbot@cgreen.in) for every row, where the Google sheet carried
+    the agent's own address. Left alone, every collection would join to the same
+    non-existent employee and the leaderboard would collapse to a single row.
+
+    Codes are matched case-insensitively and trimmed: emp_details contains values
+    with trailing tabs.
+    """
+    cursor = conn.cursor()
+    cursor.execute(ROSTER_SQL)
+    roster = {
+        str(code).strip().upper(): str(email).strip()
+        for code, email in cursor.fetchall()
+    }
+    cursor.close()
+    return roster
+
+
+def resolve_agent_email(emp_id, roster: dict[str, str] | None):
+    """
+    The agent's own address, or None — never the bot's.
+
+    None is deliberate. `server.ts` groups the leaderboard by
+    COALESCE(empcode, email_id, agent_name, ...), so a NULL email falls through
+    to the agent's name from the sheet and still produces one entry per person.
+    Keeping the bot address would instead merge every agent into one.
+    """
+    if not roster or emp_id is None:
+        return None
+    return roster.get(str(emp_id).strip().upper())
+
+
+def transform(df: pd.DataFrame, roster: dict[str, str] | None = None) -> list[dict]:
     """Normalize headers, parse types, map to DB columns, generate UIDs."""
     # Normalize column names: lowercase, spaces → underscores
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    df.columns = [normalize_header(c) for c in df.columns]
 
     log.info(f"[Transform] Sheet columns after normalization: {list(df.columns)}")
 
+    # Without this guard a renamed header is silently fatal: every row would get
+    # amount_collected = None, every row would be skipped below, the run would
+    # log "Prepared 0 rows" and exit 0, and the dashboard would sit on stale data
+    # with nothing anywhere reporting a failure.
+    required = [*SHEET_COLUMNS, *CONTROL_COLUMNS]
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        log.error(
+            "[Transform] Sheet '%s' is missing expected columns: %s\n"
+            "  Found:    %s\n"
+            "  Business columns are mapped by COLUMN_MAP; '%s' and '%s' are the\n"
+            "  message-lifecycle controls and are required for edits and deletions\n"
+            "  to work. Run scripts/zoho_probe.py to see the real headers.",
+            SHEET_TAB,
+            missing,
+            list(df.columns),
+            MESSAGE_ID_COLUMN,
+            VERSION_STATUS_COLUMN,
+        )
+        sys.exit(1)
+
     rows: list[dict] = []
+    unidentified = 0
     for _, record in df.iterrows():
         # Extract sheet columns and map to DB column names
         db_row = {}
@@ -277,20 +613,69 @@ def transform(df: pd.DataFrame) -> list[dict]:
         db_row["transaction_date"] = parse_date(db_row.get("transaction_date"))
         db_row["date_of_message_sent"] = parse_datetime(db_row.get("date_of_message_sent"))
         db_row["amount_collected"] = parse_amount(db_row.get("amount_collected"))
+        for identifier in IDENTIFIER_COLUMNS:
+            db_row[identifier] = parse_identifier(db_row.get(identifier))
+
+        # The sheet's email_id is the Cliq bot, so recover the agent from the
+        # employee code. Never fall back to the bot address — see
+        # resolve_agent_email.
+        db_row["email_id"] = resolve_agent_email(db_row.get("emp_id"), roster)
 
         # Replace empty strings and NaN with None
         for key in db_row:
             if db_row[key] == "" or (isinstance(db_row[key], float) and pd.isna(db_row[key])):
                 db_row[key] = None
 
-        db_row["uid"] = generate_uid(db_row)
+        # Identity comes from the message id, so an edited message keeps its row.
+        message_id = record.get(MESSAGE_ID_COLUMN)
+        db_row["uid"] = generate_uid(message_id)
+        if db_row["uid"] is None:
+            unidentified += 1
+            continue
+
+        # Stored as well as hashed: uid is one-way, and this column is what marks
+        # a row as owned by this ETL (see SELECT_LIVE_UIDS_SQL).
+        db_row["msg_id"] = str(message_id).strip()
+
+        db_row["version_status"] = (
+            DELETED_STATUS if is_deleted(record.get(VERSION_STATUS_COLUMN)) else None
+        )
 
         # Skip rows without a valid collection amount (e.g., PTP messages
-        # accidentally posted and logged before deletion)
+        # accidentally posted and logged before deletion). A row already in the
+        # database that later loses its amount is caught by reconciliation.
         if db_row["amount_collected"] is None or db_row["amount_collected"] == 0:
             continue
 
         rows.append(db_row)
+
+    if unidentified:
+        log.warning(
+            f"[Transform] {unidentified} rows have no '{MESSAGE_ID_COLUMN}' and were skipped — "
+            "they cannot be identified, so an edit or deletion could never be applied to them."
+        )
+
+    # An unmatched employee code costs the row its roster name and photo, and
+    # groups it on the sheet's hand-typed agent name instead. Worth seeing.
+    if roster is not None and rows:
+        unmatched = sorted({r["emp_id"] for r in rows if not r["email_id"] and r["emp_id"]})
+        if unmatched:
+            log.warning(
+                f"[Transform] {len(unmatched)} employee codes are not in emp_details: "
+                f"{unmatched[:10]}{' ...' if len(unmatched) > 10 else ''} — "
+                "those agents fall back to the sheet's agent_name."
+            )
+
+    # A null date_of_message_sent is invisible on the dashboard: it fails every
+    # daily/monthly period filter and sorts last in the recent-collections feed.
+    # The row still loads, so this is a warning, not a failure — but a high count
+    # means parse_datetime does not understand Zoho's date encoding.
+    undated = sum(1 for row in rows if row["date_of_message_sent"] is None)
+    if undated:
+        log.warning(
+            f"[Transform] {undated}/{len(rows)} rows have an unparseable date_of_message_sent. "
+            "These will load but will NOT appear in dashboard KPIs or the live feed."
+        )
 
     # Sort chronologically: earliest dates first, latest last.
     rows.sort(key=lambda r: (
@@ -313,12 +698,14 @@ INSERT INTO collections_messages (
     client_name, bucket, loan_no, customer_name, amount_collected,
     utr_no, transaction_date, agent_name, collection_mode,
     waiver, emp_id, tl_name, email_id, sender_name,
-    date_of_message_sent, message_sent, link_to_message_sent, status, uid
+    date_of_message_sent, message_sent, link_to_message_sent, status, uid,
+    version_status, msg_id
 ) VALUES (
     %(client_name)s, %(bucket)s, %(loan_no)s, %(customer_name)s, %(amount_collected)s,
     %(utr_no)s, %(transaction_date)s, %(agent_name)s, %(collection_mode)s,
     %(waiver)s, %(emp_id)s, %(tl_name)s, %(email_id)s, %(sender_name)s,
-    %(date_of_message_sent)s, %(message_sent)s, %(link_to_message_sent)s, %(status)s, %(uid)s
+    %(date_of_message_sent)s, %(message_sent)s, %(link_to_message_sent)s, %(status)s, %(uid)s,
+    %(version_status)s, %(msg_id)s
 )
 """
 
@@ -340,15 +727,88 @@ UPDATE collections_messages SET
     date_of_message_sent = %(date_of_message_sent)s,
     message_sent         = %(message_sent)s,
     link_to_message_sent = %(link_to_message_sent)s,
-    status               = %(status)s
+    status               = %(status)s,
+    -- Rewritten every run, so a row that Zoho un-deletes (or that reappears in
+    -- the sheet after a reconciliation pass hid it) becomes visible again on its
+    -- own. Recovery needs no manual SQL.
+    version_status       = %(version_status)s,
+    msg_id               = %(msg_id)s
+WHERE uid = %(uid)s
+"""
+
+# ── Reconciliation ──────────────────────────────────────────────────────────
+# Catches rows deleted straight out of the sheet, which leave no version_status
+# behind to act on. Safe here only because Collection_Data keeps all history: if
+# the tab were ever rotated or archived, an absent row would stop meaning
+# "retracted" and this would hide real collections.
+
+# `msg_id IS NOT NULL` scopes this to rows THIS ETL imported. Rows carried over
+# from the old Google sheet have a content-derived uid that can never appear in
+# what Zoho reports, so without this they would be permanent deletion candidates
+# — and the ratio guard only hides that until Zoho itself grows past ~4x the
+# legacy row count, at which point one run would flag the entire history.
+SELECT_LIVE_UIDS_SQL = f"""
+SELECT uid FROM collections_messages
+WHERE msg_id IS NOT NULL
+  AND (version_status IS NULL OR version_status <> '{DELETED_STATUS}')
+"""
+
+MARK_DELETED_SQL = """
+UPDATE collections_messages
+SET version_status = %(version_status)s
 WHERE uid = %(uid)s
 """
 
 
+def reconcile(cursor, live_uids: set[str]) -> int:
+    """
+    Hide database rows the sheet no longer lists.
+
+    A row can disappear from the sheet without ever being flagged DELETED —
+    someone removes the spreadsheet row, or the Cliq→Sheet automation rewrites
+    it. Nothing in the payload reports that, so without this pass the row stays
+    live in MySQL and keeps scoring points forever.
+
+    This marks rather than deletes, which makes a mistake recoverable: if the row
+    reappears, the normal UPDATE above clears version_status again.
+    """
+    if not RECONCILE_ENABLED:
+        return 0
+
+    cursor.execute(SELECT_LIVE_UIDS_SQL)
+    db_live_uids = {row[0] for row in cursor.fetchall()}
+
+    missing = db_live_uids - live_uids
+    if not missing:
+        return 0
+
+    # A partial fetch would make almost every row look deleted. Rather than trust
+    # that the sheet really did shrink, refuse to act and say so — one stale run
+    # is cheap, mass-hiding the leaderboard is not.
+    if db_live_uids and len(live_uids) < RECONCILE_MIN_RATIO * len(db_live_uids):
+        log.warning(
+            f"[Reconcile] SKIPPED — sheet has {len(live_uids)} live rows but the database has "
+            f"{len(db_live_uids)}, below the {RECONCILE_MIN_RATIO:.0%} threshold. "
+            f"This usually means a partial fetch or the wrong tab, not {len(missing)} deletions. "
+            "Set RECONCILE_MIN_RATIO if the sheet really did shrink this much."
+        )
+        return 0
+
+    if RECONCILE_DRY_RUN:
+        log.info(f"[Reconcile] DRY RUN — would mark {len(missing)} rows as {DELETED_STATUS}")
+        return 0
+
+    for uid in missing:
+        cursor.execute(MARK_DELETED_SQL, {"uid": uid, "version_status": DELETED_STATUS})
+
+    return len(missing)
+
+
 def load(rows: list[dict]):
     """
-    Insert new rows, update existing ones. Uses SELECT + INSERT/UPDATE
-    instead of ON DUPLICATE KEY UPDATE to avoid auto_increment gaps.
+    Insert new rows, update existing ones, then hide rows the sheet dropped.
+    Uses SELECT + INSERT/UPDATE instead of ON DUPLICATE KEY UPDATE to avoid
+    auto_increment gaps.
     """
     conn = None
     try:
@@ -374,9 +834,17 @@ def load(rows: list[dict]):
                 cursor.execute(INSERT_SQL, row)
                 inserted += 1
 
+        deleted_in_sheet = sum(1 for row in rows if row["version_status"] == DELETED_STATUS)
+        live_uids = {row["uid"] for row in rows if row["version_status"] != DELETED_STATUS}
+        reconciled = reconcile(cursor, live_uids)
+
         conn.commit()
         cursor.close()
-        log.info(f"[Load] Inserted {inserted}, updated {updated} rows")
+
+        log.info(
+            f"[Load] Inserted {inserted}, updated {updated} rows "
+            f"({deleted_in_sheet} flagged deleted by Zoho, {reconciled} hidden by reconciliation)"
+        )
 
     except MySQLError as e:
         log.error(f"MySQL error: {e}")
@@ -391,8 +859,18 @@ def load(rows: list[dict]):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def connect():
+    return mysql.connector.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+    )
+
+
 def main():
-    log.info("ETL starting: Google Sheets → MySQL")
+    log.info("ETL starting: Zoho Sheet → MySQL")
 
     df = extract()
 
@@ -400,7 +878,15 @@ def main():
         log.warning("Sheet returned 0 rows. Nothing to do.")
         return
 
-    rows = transform(df)
+    conn = connect()
+    try:
+        roster = load_roster_emails(conn)
+        log.info(f"[Transform] Loaded {len(roster)} employee codes from emp_details")
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+    rows = transform(df, roster)
     load(rows)
 
     log.info("ETL complete ✓")
