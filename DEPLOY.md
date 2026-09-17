@@ -2,6 +2,13 @@
 
 Handoff document for the devops team. Assumes no prior knowledge of this repo.
 
+> **Current ingestion path:** Zoho Sheet → Zoho Flow → authenticated
+> `POST /api/integrations/zoho/collections` → `collections_messages`. The
+> `etl` material described below is retained only as a rollback artifact; it is
+> no longer included in `docker-compose.yml` and must not run alongside Flow.
+> Follow [docs/ZOHO_FLOW_INTEGRATION.md](docs/ZOHO_FLOW_INTEGRATION.md) for the
+> Flow configuration, secret, test, cutover, and rollback steps.
+
 ---
 
 ## 1. What this is
@@ -81,8 +88,11 @@ mysql -h <host> -u <admin-user> -p <schema> < db/003_version_status.sql
 mysql -h <host> -u <admin-user> -p <schema> < db/004_msg_id.sql
 ```
 
-**Both must be applied before pointing the new ETL at the schema** — every insert
-carries `version_status` and `msg_id`, so a missing column fails the whole run.
+**Both must be applied before enabling the Zoho Flow webhook** (or the rollback
+ETL) — every insert carries `version_status` and `msg_id`, so a missing column
+fails every request, and every dashboard query filters on `version_status`.
+Both are additive and idempotent: they add a nullable column only if it is
+missing and never drop, recreate, or rewrite existing data.
 
 > **All five tables must live in the SAME schema.** Every SQL statement in
 > `server.ts` uses unqualified table names, so they all resolve against `DB_NAME`.
@@ -209,7 +219,10 @@ deterministically.
 
 ## 3. Environment variables
 
-Copy `.env.example` to `.env` and fill it in. Both containers read the same file.
+Copy `.env.example` to `.env` and fill it in. The file is grouped into
+**required**, **optional**, and **legacy ETL** (rollback only) sections. The
+compose file pins `PORT=3001` and `NODE_ENV=production` inside the app
+container, so the reverse proxy always targets container port `3001`.
 
 | Variable | Required | Default | What breaks if wrong |
 |---|---|---|---|
@@ -224,6 +237,15 @@ Copy `.env.example` to `.env` and fill it in. Both containers read the same file
 | `NODE_ENV` | yes | — | Must be `production`, or the server won't serve `dist/` and you get 404s |
 | `TZ` | yes | `Asia/Kolkata` | Daily/monthly KPIs roll over at the wrong hour |
 | `DASHBOARD_STREAM_POLL_MS` | no | `2000` | See §8 — this cost is **per connected TV** |
+| `ZOHO_FLOW_WEBHOOK_SECRET` | yes | — | Webhook answers `503`; no collections ingested. Secret store only — never commit |
+| `ZOHO_FLOW_MAX_BODY_BYTES` | no | `64kb` | Oversized Flow payloads rejected |
+| `GOOGLE_PHOTOS_CREDENTIALS` | no | `credentials1.json` | Path *inside* the container |
+| `GOOGLE_PHOTOS_TOKEN` | no | `token1.json` | Path *inside* the container |
+
+**Legacy ETL only** (`Dockerfile.etl`, rollback path — not read by the app):
+
+| Variable | Required | Default | What breaks if wrong |
+|---|---|---|---|
 | `IMPORT_INTERVAL_SECONDS` | no | `60` | How stale the dashboard gets |
 | `ZOHO_CLIENT_ID` | yes | — | ETL exits 1 naming the missing variable |
 | `ZOHO_CLIENT_SECRET` | yes | — | ETL exits 1 naming the missing variable |
@@ -240,8 +262,6 @@ Copy `.env.example` to `.env` and fill it in. Both containers read the same file
 | `RECONCILE_MISSING_ROWS` | no | `true` | **Set `false` if the sheet is ever rotated/archived** — see §2.2 |
 | `RECONCILE_MIN_RATIO` | no | `0.8` | Refuses to reconcile below this share; guards against a partial fetch |
 | `RECONCILE_DRY_RUN` | no | `false` | Log what would be hidden without changing anything |
-| `GOOGLE_PHOTOS_CREDENTIALS` | no | `credentials1.json` | Path *inside* the container |
-| `GOOGLE_PHOTOS_TOKEN` | no | `token1.json` | Path *inside* the container |
 
 > **Zoho data centre.** The two `ZOHO_*_URL` values must both point at the DC the
 > account was provisioned in — `.in` for India, `.com` for the US, `.eu`, `.com.au`.
@@ -301,10 +321,14 @@ cp .env.example .env    # then edit it
 docker compose up -d --build
 ```
 
+This starts the `app` service only. The ETL is intentionally absent — Zoho Flow
+is the ingestion path.
+
 ### Without compose
 
 ```bash
 docker build -t cgreen-dashboard-app:latest -f Dockerfile .
+# Rollback only — never run alongside Zoho Flow:
 docker build -t cgreen-dashboard-etl:latest -f Dockerfile.etl .
 ```
 

@@ -1,4 +1,5 @@
 import express from "express";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { access, readFile, writeFile } from "node:fs/promises";
 import mysql from "mysql2/promise";
 import path from "node:path";
@@ -96,6 +97,9 @@ const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
 const distDir = path.join(__dirname, "dist");
 const dashboardStreamPollMs = Number(process.env.DASHBOARD_STREAM_POLL_MS ?? "2000");
+const zohoFlowWebhookSecret = process.env.ZOHO_FLOW_WEBHOOK_SECRET;
+const zohoFlowMaxBodyBytes = process.env.ZOHO_FLOW_MAX_BODY_BYTES ?? "64kb";
+const businessTimeZone = process.env.TZ ?? "Asia/Kolkata";
 const CELEBRATION_MIN_RP = 500;
 const RP_MULTIPLIER_SCALE = 0.1;
 // A collection posted in Zoho Cliq can be retracted after the fact. The ETL
@@ -208,13 +212,25 @@ const employeeMapSql = `
 
 app.use((_req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
   if (_req.method === "OPTIONS") {
     res.status(204).end();
     return;
   }
   next();
+});
+
+// This is intentionally global so malformed or oversized JSON is rejected
+// before it reaches the Zoho Flow integration route. The dashboard endpoints
+// remain GET-only and do not consume request bodies.
+app.use(express.json({ limit: zohoFlowMaxBodyBytes }));
+app.use((error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (error instanceof SyntaxError && "body" in error) {
+    res.status(400).json({ error: "Malformed JSON request body." });
+    return;
+  }
+  next(error);
 });
 
 function warnGooglePhotoAuth(message: string) {
@@ -939,6 +955,257 @@ function writeSseEvent(res: express.Response, event: string, data: unknown) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
+
+type ZohoFlowCollectionInput = Record<string, unknown>;
+
+type ZohoFlowCollectionRow = {
+  client_name: string | null;
+  bucket: string | null;
+  loan_no: string;
+  customer_name: string | null;
+  amount_collected: number;
+  utr_no: string | null;
+  transaction_date: string | null;
+  agent_name: string;
+  collection_mode: string | null;
+  waiver: string | null;
+  emp_id: string | null;
+  tl_name: string | null;
+  email_id: string | null;
+  sender_name: string | null;
+  date_of_message_sent: string;
+  message_sent: string | null;
+  link_to_message_sent: string | null;
+  status: string | null;
+  version_status: string | null;
+  msg_id: string;
+  uid: string;
+};
+
+const zohoFlowFieldLimits = {
+  client_name: 255,
+  bucket: 50,
+  loan_no: 50,
+  customer_name: 255,
+  utr_no: 100,
+  agent_name: 255,
+  collection_mode: 100,
+  waiver: 100,
+  emp_id: 50,
+  tl_name: 255,
+  email_id: 255,
+  sender_name: 255,
+  status: 50,
+  version_status: 50,
+  msg_id: 100
+} as const;
+
+function webhookIsAuthorized(authorization: string | undefined) {
+  if (!zohoFlowWebhookSecret) return false;
+  const supplied = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!supplied) return false;
+  const expectedBuffer = Buffer.from(zohoFlowWebhookSecret);
+  const suppliedBuffer = Buffer.from(supplied);
+  return expectedBuffer.length === suppliedBuffer.length && timingSafeEqual(expectedBuffer, suppliedBuffer);
+}
+
+function optionalText(value: unknown, field: string, maximumLength: number) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" && typeof value !== "number") {
+    throw new Error(`${field} must be text.`);
+  }
+  const normalized = String(value).trim();
+  if (!normalized) return null;
+  if (normalized.length > maximumLength) throw new Error(`${field} is too long.`);
+  return normalized;
+}
+
+function requiredText(value: unknown, field: string, maximumLength: number) {
+  const normalized = optionalText(value, field, maximumLength);
+  if (!normalized) throw new Error(`${field} is required.`);
+  return normalized;
+}
+
+function parseCollectionAmount(value: unknown) {
+  if (typeof value !== "number" && typeof value !== "string") {
+    throw new Error("collection_amt must be a number.");
+  }
+  const text = String(value).trim();
+  if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(text)) {
+    throw new Error("collection_amt must be a non-negative decimal with at most two decimal places.");
+  }
+  const amount = Number(text);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 999_999_999_999.99) {
+    throw new Error("collection_amt must be greater than zero and within the supported range.");
+  }
+  return amount;
+}
+
+function parseDate(value: unknown, field: string) {
+  const text = requiredText(value, field, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) throw new Error(`${field} must use YYYY-MM-DD.`);
+  const date = new Date(`${text}T00:00:00Z`);
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== text) {
+    throw new Error(`${field} is not a valid date.`);
+  }
+  return text;
+}
+
+function formatInBusinessTimeZone(date: Date) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: businessTimeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}:${values.second}`;
+}
+
+function parseMessageTimestamp(value: unknown) {
+  const text = requiredText(value, "date_of_message_sent", 64);
+  // An offset-bearing ISO timestamp is unambiguous. A local MySQL-style value
+  // is also accepted and treated as the configured business-local wall clock.
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(text)) {
+    const [datePart] = text.split(" ");
+    parseDate(datePart, "date_of_message_sent");
+    return text;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(text) || !/(Z|[+-]\d{2}:\d{2})$/i.test(text)) {
+    throw new Error("date_of_message_sent must be an ISO-8601 timestamp with a timezone offset.");
+  }
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) throw new Error("date_of_message_sent is not a valid timestamp.");
+  return formatInBusinessTimeZone(date);
+}
+
+async function resolveWebhookAgentEmail(empId: string | null) {
+  if (!empId) return null;
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT NULLIF(MAX(TRIM(caller_emailid)), '') AS email_id
+     FROM emp_details
+     WHERE LOWER(TRIM(caller_empcode)) = LOWER(TRIM(?))`,
+    [empId]
+  );
+  return (rows[0]?.email_id as string | null | undefined) ?? null;
+}
+
+async function normalizeZohoFlowCollection(input: ZohoFlowCollectionInput): Promise<ZohoFlowCollectionRow> {
+  const msgId = requiredText(input.msg_id, "msg_id", zohoFlowFieldLimits.msg_id);
+  const requestedVersionStatus = optionalText(input.version_status, "version_status", zohoFlowFieldLimits.version_status)?.toUpperCase();
+  // Match the existing ETL contract: only DELETED changes dashboard visibility;
+  // source values such as ACTIVE are informational and remain NULL here.
+  const versionStatus = requestedVersionStatus === "DELETED" ? "DELETED" : null;
+  if (versionStatus === "DELETED") {
+    return {
+      msg_id: msgId,
+      uid: createHash("sha256").update(msgId).digest("hex"),
+      version_status: "DELETED"
+    } as ZohoFlowCollectionRow;
+  }
+
+  const empId = optionalText(input.emp_id, "emp_id", zohoFlowFieldLimits.emp_id);
+  return {
+    client_name: optionalText(input.client_name, "client_name", zohoFlowFieldLimits.client_name),
+    bucket: optionalText(input.bucket, "bucket", zohoFlowFieldLimits.bucket),
+    loan_no: requiredText(input.loan_id, "loan_id", zohoFlowFieldLimits.loan_no),
+    customer_name: optionalText(input.customer_name, "customer_name", zohoFlowFieldLimits.customer_name),
+    amount_collected: parseCollectionAmount(input.collection_amt),
+    utr_no: optionalText(input.utr_number, "utr_number", zohoFlowFieldLimits.utr_no),
+    transaction_date: input.date_of_collection == null || input.date_of_collection === "" ? null : parseDate(input.date_of_collection, "date_of_collection"),
+    agent_name: requiredText(input.name_of_agent, "name_of_agent", zohoFlowFieldLimits.agent_name),
+    collection_mode: optionalText(input.group, "group", zohoFlowFieldLimits.collection_mode),
+    waiver: optionalText(input.waiver, "waiver", zohoFlowFieldLimits.waiver),
+    emp_id: empId,
+    tl_name: optionalText(input.tl_name, "tl_name", zohoFlowFieldLimits.tl_name),
+    // The Sheet's email_id is the Cliq bot. Preserve ETL behaviour by deriving
+    // the collector email from the roster instead of trusting that value.
+    email_id: await resolveWebhookAgentEmail(empId),
+    sender_name: optionalText(input.sender_name_ai, "sender_name_ai", zohoFlowFieldLimits.sender_name),
+    date_of_message_sent: parseMessageTimestamp(input.date_of_message_sent),
+    message_sent: optionalText(input.message_sent, "message_sent", 65_535),
+    link_to_message_sent: optionalText(input.link_to_message, "link_to_message", 65_535),
+    status: optionalText(input.ai_status, "ai_status", zohoFlowFieldLimits.status),
+    version_status: versionStatus,
+    msg_id: msgId,
+    uid: createHash("sha256").update(msgId).digest("hex")
+  };
+}
+
+const zohoFlowUpsertSql = `
+  INSERT INTO collections_messages (
+    client_name, bucket, loan_no, customer_name, amount_collected, utr_no,
+    transaction_date, agent_name, collection_mode, waiver, emp_id, tl_name,
+    email_id, sender_name, date_of_message_sent, message_sent,
+    link_to_message_sent, status, uid, version_status, msg_id
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON DUPLICATE KEY UPDATE
+    client_name = VALUES(client_name), bucket = VALUES(bucket), loan_no = VALUES(loan_no),
+    customer_name = VALUES(customer_name), amount_collected = VALUES(amount_collected),
+    utr_no = VALUES(utr_no), transaction_date = VALUES(transaction_date),
+    agent_name = VALUES(agent_name), collection_mode = VALUES(collection_mode),
+    waiver = VALUES(waiver), emp_id = VALUES(emp_id), tl_name = VALUES(tl_name),
+    email_id = VALUES(email_id), sender_name = VALUES(sender_name),
+    date_of_message_sent = VALUES(date_of_message_sent), message_sent = VALUES(message_sent),
+    link_to_message_sent = VALUES(link_to_message_sent), status = VALUES(status),
+    version_status = VALUES(version_status), msg_id = VALUES(msg_id)
+`;
+
+app.post("/api/integrations/zoho/collections", async (req, res) => {
+  if (!zohoFlowWebhookSecret) {
+    console.error("[zoho-flow] ZOHO_FLOW_WEBHOOK_SECRET is not configured");
+    res.status(503).json({ error: "Integration is not configured" });
+    return;
+  }
+  if (!webhookIsAuthorized(req.header("authorization"))) {
+    console.warn("[zoho-flow] rejected unauthenticated collection request");
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  if (!req.body || Array.isArray(req.body) || typeof req.body !== "object") {
+    res.status(400).json({ error: "Expected one JSON collection object." });
+    return;
+  }
+
+  try {
+    const row = await normalizeZohoFlowCollection(req.body as ZohoFlowCollectionInput);
+    if (row.version_status === "DELETED") {
+      const [result] = await pool.execute<mysql.ResultSetHeader>(
+        "UPDATE collections_messages SET version_status = 'DELETED' WHERE uid = ?",
+        [row.uid]
+      );
+      if (result.affectedRows === 0) {
+        res.status(404).json({ error: "No existing collection matches msg_id." });
+        return;
+      }
+      res.json({ status: "deleted", msgId: row.msg_id });
+      return;
+    }
+
+    const [result] = await pool.execute<mysql.ResultSetHeader>(zohoFlowUpsertSql, [
+      row.client_name, row.bucket, row.loan_no, row.customer_name, row.amount_collected,
+      row.utr_no, row.transaction_date, row.agent_name, row.collection_mode, row.waiver,
+      row.emp_id, row.tl_name, row.email_id, row.sender_name, row.date_of_message_sent,
+      row.message_sent, row.link_to_message_sent, row.status, row.uid, row.version_status, row.msg_id
+    ]);
+    const created = result.affectedRows === 1 && result.insertId > 0;
+    res.status(created ? 201 : 200).json({
+      status: created ? "created" : "updated",
+      msgId: row.msg_id
+    });
+  } catch (error) {
+    if (error instanceof Error && /(?:required|must|too long|not a valid|supported range)/.test(error.message)) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    console.error("[zoho-flow] collection upsert failed", error instanceof Error ? error.message : "Unknown error");
+    res.status(503).json({ error: "Unable to store collection." });
+  }
+});
 
 app.get("/api/health", async (_req, res) => {
   try {

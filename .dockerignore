@@ -12,6 +12,13 @@ token*.json
 .env.*
 !.env.example
 
+# Data files — not needed by any image. db/ holds the PII roster seed
+# (002_emp_details_data.sql); CSV exports hold real collection records. Keeping
+# them out of the context keeps them out of the build cache too.
+db/
+*.csv
+docs/
+
 # Local runtime state (import_sheets.log is ~51 MB and would bloat the build context)
 *.log
 *.pid

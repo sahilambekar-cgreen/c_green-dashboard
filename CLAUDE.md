@@ -22,19 +22,20 @@
 - **Frontend:** React 19 + TypeScript, Vite 7, Tailwind CSS 4 (via `@tailwindcss/vite`), Framer Motion, lucide-react icons, canvas-confetti, use-sound.
 - **Backend:** Express 5 served via `tsx` (no separate compile step), MySQL access via `mysql2/promise`, live dashboard updates via Server-Sent Events.
 - **Data import tooling:** Python 3 (`mysql-connector-python`, `pandas`, `requests`). `import_sheets.py` is the only ETL — Zoho Sheet → MySQL, over the Zoho Sheet API v2.
-- **Deployment:** two Docker images — `Dockerfile` (Node app) and `Dockerfile.etl` (Python ETL sidecar). See [DEPLOY.md](DEPLOY.md).
+- **Ingestion:** Zoho Cliq → Zoho Sheet → Zoho Flow → `POST /api/integrations/zoho/collections` (Bearer `ZOHO_FLOW_WEBHOOK_SECRET`) → `collections_messages`. See [docs/ZOHO_FLOW_INTEGRATION.md](docs/ZOHO_FLOW_INTEGRATION.md). `import_sheets.py` is now the rollback path only.
+- **Deployment:** two Docker images — `Dockerfile` (Node app, the only service compose starts) and `Dockerfile.etl` (Python ETL, rollback only). See [DEPLOY.md](DEPLOY.md).
 
 ## Directory Structure
 
 - [src/](src/) — React app (`App.tsx`, `main.tsx`, `index.css`, `design-system.css`, `privacy.ts`, `vite-env.d.ts`). `design-system.css` contains the dashboard-owned copy of every CGReen brand token so builds never depend on the sibling `CGreen Design System` directory; `privacy.ts` contains shared display-data masking rules used by both the API and UI; `agent-name.ts` resolves the agent display name (roster → email-derived → source sheet → `Unassigned`).
-- [server.ts](server.ts) — Express API server. Exposes `/api/health`, `/api/dashboard`, `/api/dashboard/stream` (SSE live feed), `/api/dashboard.js`. In production it also serves the built `dist/` and injects the dashboard payload into `index.html` server-side.
+- [server.ts](server.ts) — Express API server. Exposes `/api/health`, `POST /api/integrations/zoho/collections` (Zoho Flow webhook), `/api/dashboard`, `/api/dashboard/stream` (SSE live feed), `/api/dashboard.js`. In production it also serves the built `dist/` and injects the dashboard payload into `index.html` server-side.
 - [dist/](dist/) — Vite build output (generated, not hand-edited).
 - [import_sheets.py](import_sheets.py) — Zoho Sheet → MySQL ETL. One-shot and idempotent: every run is a full upsert keyed on a SHA-256 `uid`, which is a hash of the Cliq **message id** — an identity key, not a content hash, so an edited message updates its row instead of inserting a duplicate. Writes nothing to disk — Zoho auth is three env vars, so the ETL container needs no credential mounts and runs read-only.
 - [scripts/zoho_probe.py](scripts/zoho_probe.py) — read-only diagnostic. Prints the sheet's real headers, how each cell would parse, and which `COLUMN_MAP` entries are missing. Run it whenever the source sheet changes shape.
 - [Dockerfile](Dockerfile) — multi-stage build of the app image (Node 22 Alpine, tini, non-root uid 1000).
 - [Dockerfile.etl](Dockerfile.etl) — ETL sidecar image (Python 3.12 slim).
 - [docker/etl-loop.sh](docker/etl-loop.sh) — interval loop wrapper around `import_sheets.py`; honours `IMPORT_INTERVAL_SECONDS` and traps SIGTERM.
-- [docker-compose.yml](docker-compose.yml) — reference stack (`app` + `etl`). Deliberately has no MySQL service; the dashboard uses an existing production database.
+- [docker-compose.yml](docker-compose.yml) — reference stack (`app` only; the `etl` service was removed so it never runs alongside Zoho Flow). Pins `PORT=3001` and `NODE_ENV=production` inside the container; everything else comes from `.env`. Deliberately has no MySQL service; the dashboard uses an existing production database.
 - [.env.example](.env.example) — the full environment contract. Copy to `.env`.
 - [db/001_dashboard_tables.sql](db/001_dashboard_tables.sql) — DDL for the two tables production must add, plus the pre-flight check and least-privilege grants. Schema only, safe to commit.
 - `db/002_emp_details_data.sql` — populated 162-row `emp_details` seed, `INSERT IGNORE` so re-runs are safe. **Gitignored: contains real employee names and emails.** Transferred to devops out-of-band.
@@ -49,8 +50,8 @@
 - `npm start` — `NODE_ENV=production tsx server.ts`, serves built `dist/` + API from one process.
 - `python3 import_sheets.py` — one ETL run. Fully unattended on every run, including the first: the Zoho refresh token comes from the environment and is never cached to disk.
 - `python3 scripts/zoho_probe.py` — print the Zoho sheet's real headers and cell encodings without touching MySQL. Run this before editing `COLUMN_MAP`.
-- `docker compose up -d --build` — build and run the full stack (app + ETL sidecar). Requires `.env`, copied from `.env.example`.
-- `docker compose logs -f etl` — watch ETL cycles.
+- `docker compose up -d --build` — build and run the app. Requires `.env`, copied from `.env.example` (grouped into required / optional / legacy-ETL sections).
+- `docker compose logs -f app` — watch the app, including `[zoho-flow]` webhook log lines.
 - Live dashboard stream polling defaults to every 2 seconds inside the API server; override with `DASHBOARD_STREAM_POLL_MS`. This cost is **per connected client**.
 - No test suite currently exists in this repo. Verification is done by running the stack and checking `/api/health`, `/api/photo-health`, `/api/dashboard`, and the ETL logs.
 - `tsx` is a **runtime** dependency, not a devDependency — the production server executes TypeScript directly, so the pruned container image needs it.
@@ -99,7 +100,9 @@ Recovery Points (RP) and celebration qualification flow:
 
 Full detail in [DEPLOY.md](DEPLOY.md). The parts that constrain code changes:
 
-- **Two images, one stack.** `app` (Express + built `dist/`, port 3001) and `etl` (`import_sheets.py` on a loop). No MySQL container — production supplies the database.
+- **Two images, one running service.** `app` (Express + built `dist/`, port 3001, behind the proxy at `https://collections.dashboard.cgreen.in`) is the only compose service. `etl` (`import_sheets.py` on a loop) is rollback-only and must never run alongside Zoho Flow. No MySQL container — production supplies the database.
+- **Migrations 003 and 004 are required** on the production schema before enabling the webhook: its upsert writes `version_status` and `msg_id`.
+- **`.dockerignore` also excludes `db/`, `docs/`, and `*.csv`** so the PII roster seed and data exports never enter the build context or cache.
 - **Two Google credential files are mounted on the `app` image only, never baked in.** `credentials1.json` / `token1.json`, used solely for employee photos. `.dockerignore` excludes `credentials*.json` and `token*.json` specifically. Do not add them to a `COPY`.
 - **`token1.json` must be mounted read-write.** `server.ts` rewrites it on refresh, so a `:ro` mount fails at refresh time — not at startup — and survives a smoke test.
 - **The `etl` image mounts nothing and runs `read_only: true`.** Zoho auth is `ZOHO_CLIENT_ID` / `ZOHO_CLIENT_SECRET` / `ZOHO_REFRESH_TOKEN` in the environment. Do not reintroduce a token cache file.

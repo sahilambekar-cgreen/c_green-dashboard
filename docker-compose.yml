@@ -17,12 +17,22 @@ services:
     image: cgreen-dashboard-app:latest
     container_name: cgreen-dashboard-app
     restart: unless-stopped
+    # All runtime configuration and secrets (DB_*, ZOHO_FLOW_WEBHOOK_SECRET, ...)
+    # come from .env or the deployment environment — never from this file.
     env_file:
       - .env
+    environment:
+      # Pinned because the port mapping and the served frontend depend on them:
+      # a different PORT in .env would leave the proxy pointing at a dead port
+      # while the healthcheck (which reads PORT) still passes, and any NODE_ENV
+      # other than production stops the server serving dist/.
+      PORT: "3001"
+      NODE_ENV: production
     ports:
-      # Put this behind your reverse proxy. The API sends
-      # Access-Control-Allow-Origin: * on every route (server.ts:184), so it
-      # should not be exposed to the public internet directly.
+      # Put this behind the reverse proxy (production:
+      # https://collections.dashboard.cgreen.in → this port). The API sends
+      # Access-Control-Allow-Origin: * on every route, so it should not be
+      # exposed to the public internet directly.
       - "${APP_PORT:-3001}:3001"
     volumes:
       # Google Admin Directory OAuth client — read-only.
@@ -42,24 +52,6 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 3
-
-  etl:
-    build:
-      context: .
-      dockerfile: Dockerfile.etl
-    image: cgreen-dashboard-etl:latest
-    container_name: cgreen-dashboard-etl
-    restart: unless-stopped
-    env_file:
-      - .env
-    # No volumes. Zoho auth is three env vars (ZOHO_CLIENT_ID / _SECRET /
-    # _REFRESH_TOKEN) and the ETL writes nothing, so there is no credential file
-    # to mount and no writable path to own.
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
 
 volumes:
   employee-photos:
