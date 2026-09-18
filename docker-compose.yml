@@ -26,8 +26,12 @@ services:
       # a different PORT in .env would leave the proxy pointing at a dead port
       # while the healthcheck (which reads PORT) still passes, and any NODE_ENV
       # other than production stops the server serving dist/.
+      environment:
       PORT: "3001"
       NODE_ENV: production
+      DB_HOST: host.docker.internal
+      DB_PORT: "3306"
+      DB_SOCKET_PATH: ""
     ports:
       # Put this behind the reverse proxy (production:
       # https://collections.dashboard.cgreen.in → this port). The API sends
